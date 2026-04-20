@@ -28,7 +28,7 @@ class Config:
     END_INDEX = 1000
     SAVE_TERM = 10
 
-    NUSCENES_ROOT = "/mnt/nfs_shared_data/dataset/cch/nuScenes"
+    NUSCENES_ROOT = "/home/byounggun/B4DL/nuscenes"
     NUSCENES_VERSION = "v1.0-trainval" #v1.0-mini
 
     DATAROOT = "./data"

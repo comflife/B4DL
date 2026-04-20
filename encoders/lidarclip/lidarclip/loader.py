@@ -22,6 +22,8 @@ from torch.utils.data.dataloader import default_collate
 
 
 CAM_NAMES = ["cam0%d" % cam_num for cam_num in (1, 3, 5, 6, 7, 8, 9)]
+ANNOTATIONS_DIR = osp.abspath(osp.join(osp.dirname(__file__), "..", "annotations"))
+SEQUENCE_METADATA_PATH = osp.join(ANNOTATIONS_DIR, "sequence_metadata.json")
 SPLITS = {
     "train": ("train", "raw_small", "raw_medium", "raw_large"),
     "train-only": ("train",),
@@ -103,7 +105,7 @@ class NuscenesImageLidarDataset(Dataset):
         
         #################################### for 700 scenes only #########################################
         print("ok_scene_tokens: ", len(ok_scene_tokens))
-        with open("/home/youngwoo.shin/lidarclip/annotations/sequence_metadata.json", "r") as f:
+        with open(SEQUENCE_METADATA_PATH, "r") as f:
             seq_data = json.load(f)
         filtered_scene_list = []
         for seq in seq_data[-900:]:

@@ -603,8 +603,8 @@ DEFAULT_DATA_PATHS = {
     # "train": "/mnt/nfs_shared_data/dataset/nuScenes/",
     # "train-only": "/mnt/nfs_shared_data/dataset/nuScenes/",
     # "val": "/mnt/nfs_shared_data/dataset/nuScenes/",
-    "trainval": "/mnt/nfs_shared_data/dataset/cch/nuScenes/",
-    "test": "/mnt/nfs_shared_data/dataset/nuScenes/v1.0-test/",
+    "trainval": "/home/byounggun/B4DL/nuscenes/",
+    "test": "/home/byounggun/B4DL/nuscenes/v1.0-test/",
     "mini": "./v1.0-mini/",
 }
 

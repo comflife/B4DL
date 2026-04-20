@@ -22,8 +22,8 @@ def create_clean_directory(directory_path):
 
 DEFAULT_DATA_PATHS = {
     "once": "/proj/nlp4adas/datasets/once",
-    "nuscenes": "/mnt/nfs_shared_data/dataset/cch/nuScenes/",
-    "with_path": "/mnt/nfs_shared_data/dataset/cch/nuScenes/"
+    "nuscenes": "/home/byounggun/B4DL/nuscenes/",
+    "with_path": "/home/byounggun/B4DL/nuscenes/"
 }
 
 

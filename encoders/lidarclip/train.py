@@ -87,7 +87,7 @@ def train(
     resume_wandb_logging=False,
     clip_model_name="ViT-B/32",
     loss_function="mse",
-    nuscenes_datadir="/proj/berzelius-2021-92/data/nuscenes",
+    nuscenes_datadir="/home/byounggun/B4DL/nuscenes",
     nuscenes_split="train",
     dataset_name="once",
 ):
@@ -150,10 +150,10 @@ def train(
         checkpoint_save_dir = os.path.join(checkpoint_save_dir, str(wandb_logger.version))
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_save_dir,
-        save_top_k=3,
-        monitor="train_loss",
-        save_last=True,
-        every_n_train_steps=250,
+        filename="epoch{epoch:02d}",
+        save_top_k=-1,
+        save_last=False,
+        every_n_epochs=5,
         save_on_train_epoch_end=True,
     )
     learningrate_callback = LearningRateMonitor(logging_interval="step")
@@ -194,7 +194,7 @@ def parse_args():
         help="which loss function to use",
         choices=("cosine", "mse"),
     )
-    parser.add_argument("--nuscenes-datadir", default="/proj/berzelius-2021-92/data/nuscenes")
+    parser.add_argument("--nuscenes-datadir", default="/home/byounggun/B4DL/nuscenes")
     parser.add_argument("--nuscenes-split", default="train")
     parser.add_argument("--dataset-name", default="nuscenes")
     args = parser.parse_args()
