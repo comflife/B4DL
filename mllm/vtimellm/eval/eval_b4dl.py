@@ -105,7 +105,7 @@ def main(args):
             print(f"[Warning] Feature not found: {feat_path}")
             continue
 
-        features = torch.from_numpy(np.load(feat_path)).cuda()
+        features = torch.from_numpy(np.load(feat_path)).cuda().to(model.dtype)
 
         # Prepare query with <4DLiDAR> token (same as training)
         query = f"<4DLiDAR>\n{question}"
