@@ -45,6 +45,8 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     tune_mm_mlp_adapter: bool = field(default=False)
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    use_temporal_embedding: bool = field(default=False)
+    temporal_embedding_max_len: int = field(default=200)
 
 
 @dataclass
@@ -79,6 +81,9 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    lambda_reg: float = 1.0
+    use_ntl_loss: bool = False
+    lambda_ntl: float = 1.0
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -312,6 +317,12 @@ def train():
         )
         tokenizer.pad_token = tokenizer.unk_token
 
+    # Register <meta>, <4DLiDAR>, and <tg> as special tokens
+    smart_tokenizer_and_embedding_resize(
+        {"additional_special_tokens": ["<meta>", "<4DLiDAR>", "<tg>"]},
+        tokenizer,
+        model,
+    )
     
     if model_args.version in conversation_lib.conv_templates:
         conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from vtimellm.constants import IMAGE_TOKEN_INDEX, IGNORE_INDEX
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 
 class VTimeLLMMetaModel:
 
@@ -19,13 +19,47 @@ class VTimeLLMMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
             print("load mlp:", pretrain_mm_mlp_adapter)
+        
+        # Temporal Positional Embedding
+        if getattr(model_args, 'use_temporal_embedding', False):
+            max_len = getattr(model_args, 'temporal_embedding_max_len', 100)
+            self.temporal_embedding = nn.Embedding(max_len, 768)
+            print(f"Initialized temporal embedding (max_len={max_len})")
+        else:
+            self.temporal_embedding = None
 
 
-class VTimeLLMMetaForCausalLM(ABC):
+class VTimeLLMMetaForCausalLM:
 
     @abstractmethod
     def get_model(self):
         pass
+
+    @staticmethod
+    def add_temporal_embedding(images, temporal_embedding):
+        if temporal_embedding is None:
+            return images
+        max_len = temporal_embedding.num_embeddings
+        if type(images) is list:
+            result = []
+            for img in images:
+                n = img.shape[0]
+                # Normalize frame position to 0~max_len-1 (relative position)
+                pos = (torch.arange(n, device=img.device).float() / n * max_len).long().clamp(max=max_len - 1)
+                emb = temporal_embedding(pos)
+                result.append(img + emb)
+            return result
+        else:
+            if len(images.shape) == 2:
+                n = images.shape[0]
+                pos = (torch.arange(n, device=images.device).float() / n * max_len).long().clamp(max=max_len - 1)
+                emb = temporal_embedding(pos)
+                return images + emb
+            else:
+                b, n = images.shape[0], images.shape[1]
+                pos = (torch.arange(n, device=images.device).float() / n * max_len).long().clamp(max=max_len - 1)
+                emb = temporal_embedding(pos).unsqueeze(0)
+                return images + emb
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels, images
@@ -47,6 +81,9 @@ class VTimeLLMMetaForCausalLM(ABC):
                 )), dim=1)
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
+
+        # Apply temporal positional embedding before projection
+        images = self.add_temporal_embedding(images, self.get_model().temporal_embedding)
 
         if type(images) is list:
             concat_images = torch.cat([image for image in images], dim=0)

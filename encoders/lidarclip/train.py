@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 # import sys
 # sys.path.append("./sst")
@@ -63,7 +64,7 @@ class LidarClip(pl.LightningModule):
             epoch_size = self.trainer.limit_train_batches
         elif self.trainer.limit_train_batches is None:
             epoch_size = int(self.epoch_size)
-        steps_per_epoch = epoch_size // self.trainer.accumulate_grad_batches
+        steps_per_epoch = math.ceil(epoch_size / self.trainer.accumulate_grad_batches)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=1e-3,

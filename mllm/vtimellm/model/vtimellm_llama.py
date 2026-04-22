@@ -23,6 +23,9 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # Temporal grounding regression head: predicts [start_frame, end_frame]
+        self.regression_head = nn.Linear(config.hidden_size, 2)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -62,6 +65,7 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
                 images
             )
 
+        # Always return hidden states for regression head usage
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -71,7 +75,7 @@ class VTimeLLMLlamaForCausalLM(LlamaForCausalLM, VTimeLLMMetaForCausalLM):
             labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=return_dict
         )
 

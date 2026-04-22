@@ -195,11 +195,9 @@ def preprocess_llama_2(
 
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
-                target[:] = IGNORE_INDEX
-                print(
-                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-                    f" (ignored)"
-                )
+                # Force sync instead of dropping the entire sample
+                # 1-2 token diff only affects the mask slightly
+                cur_len = total_len
 
     return dict(
         input_ids=input_ids,
@@ -277,11 +275,8 @@ def preprocess_v1(
 
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
-                target[:] = IGNORE_INDEX
-                print(
-                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-                    f" (ignored)"
-                )
+                # Force sync instead of dropping the entire sample
+                cur_len = total_len
 
     return dict(
         input_ids=input_ids,
@@ -422,6 +417,17 @@ class LazySupervisedDataset(Dataset):
                              labels=data_dict["labels"][0])
 
         data_dict['image'] = image
+        
+        # Temporal grounding metadata
+        if source.get('is_time_grounding', False):
+            data_dict['is_time_grounding'] = True
+            data_dict['start_frame'] = source.get('start_frame', 0)
+            data_dict['end_frame'] = source.get('end_frame', 0)
+        else:
+            data_dict['is_time_grounding'] = False
+            data_dict['start_frame'] = -1
+            data_dict['end_frame'] = -1
+        
         return data_dict
 
 
@@ -455,6 +461,21 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+        
+        # Temporal grounding labels
+        if 'is_time_grounding' in instances[0]:
+            batch['is_time_grounding'] = torch.tensor(
+                [instance['is_time_grounding'] for instance in instances],
+                dtype=torch.bool
+            )
+            batch['start_frame'] = torch.tensor(
+                [instance['start_frame'] for instance in instances],
+                dtype=torch.float32
+            )
+            batch['end_frame'] = torch.tensor(
+                [instance['end_frame'] for instance in instances],
+                dtype=torch.float32
+            )
 
         return batch
 

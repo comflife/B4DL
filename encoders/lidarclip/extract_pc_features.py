@@ -84,6 +84,7 @@ def main(args):
         for d in tqdm(frame_data):
             for f in d["frames"]:
                 frame_id = f["frame_id"]
+                sample_token = f.get("sample_token")
                 frame_path = f["PATH_LIDAR_TOP"]
                 full_frame_path = os.path.join(args.data_path, frame_path)
                 
@@ -93,6 +94,9 @@ def main(args):
                 
                 numpy_feature = frame_feature.cpu().detach().numpy()
                 np.save(frame_feature_save_path, numpy_feature)
+                if sample_token:
+                    sample_feature_save_path = os.path.join(args.stage1_save_dir, sample_token + ".npy")
+                    np.save(sample_feature_save_path, numpy_feature)
                 
 #         IF extracting for stage 2 or 3
         create_clean_directory(args.stage2_save_dir)
@@ -121,7 +125,10 @@ def main(args):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--checkpoint", type=str, default="./ckpt/trained/.ckpt file", help="Full path to the checkpoint file"
+        "--checkpoint",
+        type=str,
+        default="./ckpt/lidarclip_mm/epochepoch=14.ckpt",
+        help="Full path to the checkpoint file",
     )
     parser.add_argument("--clip-version", type=str, default="ViT-L/14")
     parser.add_argument("--data-path", type=str, default=None)

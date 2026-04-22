@@ -1,7 +1,7 @@
 #!/bin/bash
 
 MODEL_VERSION=chatglm3-6b
-gpu_vis=0 # per_device_train_batch_size * gradient_accumulation_steps * n_gpus = 128
+gpu_vis=0,1,2,3 # per_device_train_batch_size * gradient_accumulation_steps * n_gpus = global batch size
 MASTER_PORT=29570
 
 
@@ -15,7 +15,7 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT vtimellm/train
     --output_dir ./checkpoints/vtimellm-$MODEL_VERSION-stage1 \
     --bf16 True \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \

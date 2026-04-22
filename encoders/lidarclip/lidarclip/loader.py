@@ -103,24 +103,6 @@ class NuscenesImageLidarDataset(Dataset):
         #################################### for 750 scenes only #########################################
         
         
-        #################################### for 700 scenes only #########################################
-        print("ok_scene_tokens: ", len(ok_scene_tokens))
-        with open(SEQUENCE_METADATA_PATH, "r") as f:
-            seq_data = json.load(f)
-        filtered_scene_list = []
-        for seq in seq_data[-900:]:
-            filtered_scene_list.append(seq["scene_token"])
-        filtered_scene_list = list(set(filtered_scene_list))
-        
-        
-        filtered_ok_scene_tokens = [x for x in ok_scene_tokens if x not in filtered_scene_list]
-        
-        
-        ok_scene_tokens = filtered_ok_scene_tokens
-        print("ok_scene_tokens after filtering: ", len(ok_scene_tokens))
-        #################################### for 700 scenes only #########################################
-        
-        
         return [
             sample["token"]
             for sample in self._nusc.sample
