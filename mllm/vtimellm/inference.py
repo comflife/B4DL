@@ -39,7 +39,7 @@ def inference(model, image, query, tokenizer):
             input_ids,
             images=image[None,].cuda(),
             do_sample=True,
-            temperature=0.05,
+            temperature=0.3,
             num_beams=1,
             # no_repeat_ngram_size=3,
             max_new_tokens=1024,

@@ -143,6 +143,11 @@ def main(args):
     print("=" * 60)
     
     token_to_path, path_to_token = build_sample_data_maps(args.sample_data_json)
+    if args.sample_data_json_test and os.path.exists(args.sample_data_json_test):
+        token_to_path_test, path_to_token_test = build_sample_data_maps(args.sample_data_json_test)
+        token_to_path.update(token_to_path_test)
+        path_to_token.update(path_to_token_test)
+        print(f"[sample_data] Added test: {len(token_to_path_test)} entries")
     print(f"[sample_data] Built maps: {len(token_to_path)} LIDAR_TOP entries")
     
     # Stage 2: scene -> ordered list of sample_tokens
@@ -167,6 +172,8 @@ def main(args):
     required_stage2_scenes = set()
     if args.stage2_train_json and os.path.exists(args.stage2_train_json):
         required_stage2_scenes.update(get_required_stage2_scenes(args.stage2_train_json))
+    if args.stage2_test_json and os.path.exists(args.stage2_test_json):
+        required_stage2_scenes.update(get_required_stage2_scenes(args.stage2_test_json))
     
     print(f"[Stage 1] Required unique sample_tokens: {len(required_stage1_tokens)}")
     print(f"[Stage 2] Required unique scenes: {len(required_stage2_scenes)}")
@@ -330,14 +337,37 @@ def main(args):
     
     # ------------------- Stage 2: per scene_id, concatenated -------------------
     if required_stage2_scenes:
-        create_clean_directory(args.stage2_save_dir)
-        for scene_id in tqdm(sorted(required_stage2_scenes), desc="Saving Stage 2"):
+        os.makedirs(args.stage2_save_dir, exist_ok=True)
+        existing = set(f.replace('.npy', '') for f in os.listdir(args.stage2_save_dir) if f.endswith('.npy'))
+        missing_scenes = [s for s in required_stage2_scenes if s not in existing]
+        
+        saved = 0
+        skipped = 0
+        for scene_id in tqdm(sorted(missing_scenes), desc="Saving Stage 2"):
             frame_tokens = scene_frame_map[scene_id]
-            features = [lidar_dict[token] for _, token in frame_tokens]
+            features = []
+            missing_token = None
+            for _, token in frame_tokens:
+                if token not in lidar_dict:
+                    # Fallback: load from stage1_features if available
+                    stage1_path = os.path.join(args.stage1_save_dir, f"{token}.npy")
+                    if os.path.exists(stage1_path):
+                        feat = torch.from_numpy(np.load(stage1_path))
+                        lidar_dict[token] = feat
+                    else:
+                        missing_token = token
+                        break
+                features.append(lidar_dict[token])
+            
+            if missing_token:
+                skipped += 1
+                continue
+            
             concat = torch.cat(features, dim=0)
             save_path = os.path.join(args.stage2_save_dir, f"{scene_id}.npy")
             np.save(save_path, concat.cpu().detach().numpy())
-        print(f"[Stage 2] Saved {len(required_stage2_scenes)} scenes to {args.stage2_save_dir} ✅")
+            saved += 1
+        print(f"[Stage 2] Saved {saved} new scenes (skipped {skipped} incomplete, {len(existing)} existing) to {args.stage2_save_dir} ✅")
     
     print("\n" + "=" * 60)
     print("DONE!")
@@ -355,12 +385,14 @@ def parse_args():
     
     # nuScenes metadata (canonical source)
     parser.add_argument("--sample-data-json", type=str, default="/home/byounggun/B4DL/nuscenes/v1.0-trainval/sample_data.json")
+    parser.add_argument("--sample-data-json-test", type=str, default="/home/byounggun/B4DL/nuscenes/v1.0-test/sample_data.json")
     parser.add_argument("--scene-metadata-path", type=str, default="/home/byounggun/B4DL/b4dl_dataset/metadata/scene_metadata.json")
     
     # Training data (source of truth for what we need)
     parser.add_argument("--stage1-train-json", type=str, default="/home/byounggun/B4DL/lidarllm_only_dataset/stage1_train_converted.json")
     parser.add_argument("--stage1-val-json", type=str, default="/home/byounggun/B4DL/lidarllm_only_dataset/stage1_val_converted.json")
     parser.add_argument("--stage2-train-json", type=str, default="/home/byounggun/B4DL/b4dl_dataset/stage2_combined_meta_v2.json")
+    parser.add_argument("--stage2-test-json", type=str, default="/home/byounggun/B4DL/b4dl_dataset/test/temporal_understanding.json")
     
     # Output dirs
     parser.add_argument("--stage1-save-dir", type=str, default="/home/byounggun/B4DL/lidarclip/stage1_features/")
