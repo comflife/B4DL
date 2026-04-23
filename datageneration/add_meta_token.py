@@ -109,11 +109,11 @@ def add_meta_to_dataset(
         if not conversations:
             continue
         
-        # Insert <meta> at the beginning of the first human message
+        # Insert <meta> after the <4DLiDAR> question (human message)
         first_conv = conversations[0]
         if first_conv.get('from') == 'human':
             original_value = first_conv['value']
-            new_value = f"<meta>\n{meta_desc}\n\n{original_value}"
+            new_value = f"{original_value}\n<meta>\n{meta_desc}"
             first_conv['value'] = new_value
             modified_count += 1
     

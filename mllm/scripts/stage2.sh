@@ -14,20 +14,21 @@ CUDA_VISIBLE_DEVICES=$gpu_vis torchrun --nproc_per_node=$NUM_GPUS --master_port 
     --data_path ../b4dl_dataset/stage2_combined_meta.json \
     --feat_folder ../lidarclip/stage2_features \
     --pretrain_mm_mlp_adapter ../mllm/checkpoints/vtimellm-$MODEL_VERSION-stage1/mm_projector.bin \
-    --output_dir ../mllm/checkpoints/vtimellm-$MODEL_VERSION-stage2 \
+    --output_dir ../mllm/checkpoints_meta/vtimellm-$MODEL_VERSION-stage2 \
     --bf16 True \
-    --num_train_epochs 2 \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 1 \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 8 \
     --evaluation_strategy "no" \
-    --save_strategy "no" \
-    --save_total_limit 1 \
+    --save_strategy "steps" \
+    --save_steps 4633 \
+    --save_total_limit 4 \
     --learning_rate 1e-4 \
     --freeze_mm_mlp_adapter True \
-    --lora_r 64 \
-    --lora_alpha 128 \
-    --weight_decay 0. \
-    --warmup_ratio 0.03 \
+    --lora_r 128 \
+    --lora_alpha 256 \
+    --weight_decay 0.01 \
+    --warmup_ratio 0.1 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \

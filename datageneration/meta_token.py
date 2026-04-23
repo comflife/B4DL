@@ -112,42 +112,41 @@ def describe_position_change(pos_start, pos_end, yaw_start):
     return " and ".join(parts)
 
 
-def compute_meta_description(start_pose, end_pose):
-    """Convert start/end poses to natural language meta description."""
+def describe_single_pose(pose):
+    """Describe a single pose in absolute natural language."""
     # Speed
-    v_start = math.sqrt(sum(v**2 for v in start_pose['vel']))
-    v_end = math.sqrt(sum(v**2 for v in end_pose['vel']))
-    speed_desc = describe_speed_change(v_start, v_end)
+    v = math.sqrt(sum(v_i**2 for v_i in pose['vel']))
+    if v < 0.5:
+        speed_desc = "was stationary"
+    else:
+        speed_desc = f"was traveling at approximately {v:.1f} m/s"
     
     # Heading
-    q_s = start_pose['orientation']
-    yaw_start = quaternion_to_yaw(q_s[0], q_s[1], q_s[2], q_s[3])
-    q_e = end_pose['orientation']
-    yaw_end = quaternion_to_yaw(q_e[0], q_e[1], q_e[2], q_e[3])
-    heading_desc = describe_heading_change(yaw_start, yaw_end)
+    q = pose['orientation']
+    yaw = quaternion_to_yaw(q[0], q[1], q[2], q[3])
+    heading_desc = f"facing approximately {abs(yaw):.1f} degrees"
     
     # Position
-    pos_desc = describe_position_change(start_pose['pos'], end_pose['pos'], yaw_start)
+    pos = pose['pos']
+    pos_desc = f"positioned at coordinates ({pos[0]:.1f}, {pos[1]:.1f})"
     
-    # Acceleration (average magnitude, excluding gravity ~9.8)
-    a_start = math.sqrt(sum(a**2 for a in start_pose['accel']))
-    a_end = math.sqrt(sum(a**2 for a in end_pose['accel']))
-    a_avg = (a_start + a_end) / 2.0
-    # Heuristic: significant net acceleration above gravity
-    if a_avg > 10.5:
+    # Acceleration
+    a = math.sqrt(sum(a_i**2 for a_i in pose['accel']))
+    if a > 10.5:
         accel_desc = "was experiencing significant acceleration"
-    elif a_avg > 9.9:
+    elif a > 9.9:
         accel_desc = "was experiencing gentle acceleration"
     else:
         accel_desc = "maintained smooth motion"
     
-    sentences = [
-        f"The ego vehicle {speed_desc}.",
-        f"It {pos_desc} and {heading_desc}.",
-        f"The vehicle {accel_desc} throughout the sequence."
-    ]
-    
-    return " ".join(sentences)
+    return f"The ego vehicle {speed_desc}, {pos_desc}, {heading_desc}, and {accel_desc}."
+
+
+def compute_meta_description(start_pose, end_pose):
+    """Convert start/end poses to natural language meta description."""
+    first_desc = describe_single_pose(start_pose)
+    last_desc = describe_single_pose(end_pose)
+    return f"The metadata of the first frame is '{first_desc}' and the metadata of the last frame is '{last_desc}'"
 
 
 def build_scene_token_to_can_bus_mapping(can_bus_dir: str, scene_metadata_path: str, cache_path: str = None):

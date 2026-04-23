@@ -11,7 +11,11 @@ import torch.utils.checkpoint
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss, LayerNorm, MSELoss, BCEWithLogitsLoss
-from torch.nn.utils import skip_init
+try:
+    from torch.nn.utils import skip_init
+except ImportError:
+    def skip_init(module_cls, *args, **kwargs):
+        return module_cls(*args, **kwargs)
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any
 from copy import deepcopy
 
