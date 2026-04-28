@@ -106,15 +106,15 @@ def add_meta_to_dataset(
             continue
         
         conversations = item.get('conversations', [])
-        if not conversations:
-            continue
-        
-        # Insert <meta> after the <4DLiDAR> question (human message)
-        first_conv = conversations[0]
-        if first_conv.get('from') == 'human':
-            original_value = first_conv['value']
-            new_value = f"{original_value}\n<meta>\n{meta_desc}"
-            first_conv['value'] = new_value
+        if conversations:
+            first_conv = conversations[0]
+            if first_conv.get('from') == 'human':
+                original_value = first_conv['value']
+                new_value = f"{original_value}\n<meta>\n{meta_desc}"
+                first_conv['value'] = new_value
+                modified_count += 1
+        else:
+            item['meta'] = meta_desc
             modified_count += 1
     
     with open(output_json_path, 'w') as f:
