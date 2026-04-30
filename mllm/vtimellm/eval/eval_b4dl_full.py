@@ -155,6 +155,9 @@ def main(args):
 
         features = torch.from_numpy(np.load(feat_path)).cuda().to(model.dtype)
         query = f"<4DLiDAR>\n{question}"
+        meta = item.get('meta')
+        if meta:
+            query = f"{query}\n<meta>\n{meta}"
 
         with torch.no_grad():
             # Debug: check for nan/inf in features

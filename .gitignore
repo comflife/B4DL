@@ -16,3 +16,17 @@ env/
 
 .DS_Store
 Thumbs.db
+
+*.npy
+
+.codex
+*.json
+*.jsonl
+*.txt
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.log
+*.out
+wandb/

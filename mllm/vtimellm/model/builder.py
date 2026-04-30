@@ -13,6 +13,17 @@ def load_lora(model, lora_path):
         non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
         if any(k.startswith('model.model.') for k in non_lora_trainables):
             non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
+
+        # Auto-resize embeddings if checkpoint has additional special tokens
+        # (training adds <meta>, <4DLiDAR>, <tg> via smart_tokenizer_and_embedding_resize)
+        ckpt_emb = non_lora_trainables.get('model.embed_tokens.weight')
+        if ckpt_emb is not None:
+            ckpt_vocab = ckpt_emb.shape[0]
+            cur_vocab = model.get_input_embeddings().weight.shape[0]
+            if ckpt_vocab != cur_vocab:
+                print(f'Resizing embeddings: {cur_vocab} -> {ckpt_vocab} (special tokens from training)')
+                model.resize_token_embeddings(ckpt_vocab)
+
         model.load_state_dict(non_lora_trainables, strict=False)
     print('Loading LoRA weights...')
     model = PeftModel.from_pretrained(model, lora_path)

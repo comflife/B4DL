@@ -109,6 +109,9 @@ def main(args):
 
         # Prepare query with <4DLiDAR> token (same as training)
         query = f"<4DLiDAR>\n{question}"
+        meta = item.get('meta')
+        if meta:
+            query = f"{query}\n<meta>\n{meta}"
 
         # Inference
         with torch.no_grad():

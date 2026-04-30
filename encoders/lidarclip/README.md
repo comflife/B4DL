@@ -6,6 +6,5 @@ You need to train the model first, and with that trained weight, extract the fea
 ```sh
 python train.py --name=lidarclip --checkpoint-save-dir=./ckpt --batch-size 128 --workers 4 --data-dir /path/to/dataset --clip-model ViT-L/14
 
-python extract_pc_features.py --checkpoint=/path/to/trained/.ckpt --scene-json-path ./annotations/scene_metadata.json --frame-json-path ./annotations/sequence_metadata.json \
+python extract_pc_features.py --checkpoint=./ckpt/lidarclip_mm/epochepoch=14.ckpt --scene-json-path ./annotations/scene_metadata.json --frame-json-path ./annotations/sequence_metadata.json \
         --stage1-save-dir ./b4dl/stage1_features/ --stage2-save-dir ./b4dl/stage2_features/
-

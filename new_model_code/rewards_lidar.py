@@ -3,8 +3,11 @@
 Output format the dataset uses (this is *not* center-form 7-DOF; it is the
 axis-aligned-min-max plus yaw):
     [xmin, xmax, ymin, ymax, zmin, zmax, yaw]
-either as a single bracketed list or wrapped in [[...]] / <|box_start|>...<|box_end|>
-when there are multiple boxes.
+either as a single bracketed list, wrapped in [[...]] / <|box_start|>...<|box_end|>
+when there are multiple boxes, or — under the Q3D pipeline — as eight
+`<coord_*>` tokens between `<|box_start|>` and `<|box_end|>`. We accept both
+formats so this module can score legacy SFT outputs and quantised ones with
+the same call signature.
 
 We made two design choices that diverge from the user's brief because of this
 data layout:
@@ -77,10 +80,31 @@ def _strip_box_tokens(text: str) -> str:
 
 
 def parse_boxes(text: str) -> List[np.ndarray]:
-    """Extract every 7-tuple `[xmin,xmax,...,yaw]` in `text`."""
-    text = _strip_box_tokens(text)
-    boxes = []
-    for m in _BBOX_RE.finditer(text or ""):
+    """Extract every box from `text`, decoding both legacy bracketed
+    `[xmin,xmax,...,yaw]` form and Q3D `<|box_start|><coord_*>x8<|box_end|>`
+    form. Result is always a list of np.float32 arrays in
+    `[xmin, xmax, ymin, ymax, zmin, zmax, yaw]` layout, ready for the
+    geometry helpers below."""
+    if not text:
+        return []
+    boxes: List[np.ndarray] = []
+
+    # Q3D form first (so we don't strip its <|box_start|> markers below and
+    # then re-discover the inner coord tokens — _strip_box_tokens would
+    # otherwise mangle multi-box runs).
+    try:
+        from qwen_mm.quantizer import parse_quantized_boxes  # local import: optional dep
+        for box7 in parse_quantized_boxes(text):
+            v = np.asarray(box7, dtype=np.float32)
+            if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
+                boxes.append(v)
+    except Exception:
+        # Quantizer unavailable or parse failed — silently fall back to text.
+        pass
+
+    # Legacy text form (still supported for old eval logs / mixed outputs).
+    legacy_text = _strip_box_tokens(text)
+    for m in _BBOX_RE.finditer(legacy_text):
         try:
             v = np.array([float(x) for x in m.groups()], dtype=np.float32)
             if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
@@ -176,8 +200,23 @@ def ground_penalty(b: np.ndarray, ground_z: float = -1.8, tol: float = 0.5) -> f
 def adaptive_match(
     preds: Sequence[np.ndarray], gts: Sequence[np.ndarray]
 ) -> List[Tuple[int, int, float]]:
-    """Greedy matcher. A pair only matches if BEV IoU >= τ(d_gt).
-    Returns list of (pred_idx, gt_idx, iou)."""
+    """Greedy matcher with **soft** scoring.
+
+    Earlier we required BEV IoU >= τ(d_gt) for a pair to count, but that left
+    GRPO with reward variance ~0 in early training (every rollout's prediction
+    sat below the threshold and got the same constant penalty).
+
+    Now we accept any positive overlap, so the *value* (iou) carries the
+    signal. Soft-match strategy:
+      - Centre-distance fallback: if no overlap exists, we still match the
+        single closest pred-gt pair so center/heading rewards can drive
+        learning. We attribute iou=0 in that case.
+      - Adaptive threshold becomes a **gain**: pairs above τ get a 1.5x
+        weight on bev_iou so well-localised hits are rewarded extra.
+
+    Returns list of (pred_idx, gt_idx, iou_score) where iou_score is the
+    raw IoU (possibly multiplied by the adaptive bonus).
+    """
     if not preds or not gts:
         return []
     P, G = len(preds), len(gts)
@@ -185,40 +224,68 @@ def adaptive_match(
     for i in range(P):
         for j in range(G):
             iou[i, j] = bev_iou(preds[i], gts[j])
+    work = iou.copy()
     matched: List[Tuple[int, int, float]] = []
     used_p, used_g = set(), set()
     while True:
-        i, j = np.unravel_index(np.argmax(iou), iou.shape)
-        if iou[i, j] <= 0.0:
+        i, j = np.unravel_index(np.argmax(work), work.shape)
+        if work[i, j] <= 0.0:
             break
-        thr = adaptive_iou_threshold(gt_distance(gts[j]))
-        if iou[i, j] < thr:
-            iou[i, j] = -1.0
-            continue
         if i in used_p or j in used_g:
-            iou[i, j] = -1.0
+            work[i, j] = -1.0
             continue
-        matched.append((int(i), int(j), float(iou[i, j])))
+        score = float(work[i, j])
+        if score >= adaptive_iou_threshold(gt_distance(gts[j])):
+            score *= 1.5  # confident match bonus
+        matched.append((int(i), int(j), score))
         used_p.add(int(i))
         used_g.add(int(j))
-        iou[i, :] = -1.0
-        iou[:, j] = -1.0
+        work[i, :] = -1.0
+        work[:, j] = -1.0
         if len(matched) == min(P, G):
             break
+
+    # Centre-distance fallback for unmatched preds — gives continuous reward
+    # via center_reward + heading_reward even when IoU is 0.
+    if not matched and preds and gts:
+        # Match each pred to its nearest GT by centre distance.
+        c_p = np.stack([box_center(p) for p in preds])
+        c_g = np.stack([box_center(g) for g in gts])
+        d = np.linalg.norm(c_p[:, None, :] - c_g[None, :, :], axis=-1)  # (P, G)
+        used_p, used_g = set(), set()
+        while True:
+            i, j = np.unravel_index(np.argmin(d), d.shape)
+            if d[i, j] >= 1e9:
+                break
+            if i in used_p or j in used_g:
+                d[i, j] = 1e9
+                continue
+            matched.append((int(i), int(j), 0.0))
+            used_p.add(int(i))
+            used_g.add(int(j))
+            d[i, :] = 1e9
+            d[:, j] = 1e9
+            if len(matched) == min(P, G):
+                break
     return matched
 
 
 # --------------------------------------------------------------------------- top-level reward
 @dataclass
 class RewardWeights:
-    bev_iou: float = 1.0
+    bev_iou: float = 2.0  # boost real overlap signal
     center: float = 0.5
     heading: float = 0.3
-    miss: float = 1.5
-    format_bonus: float = 0.1
+    miss: float = 1.0
+    format_bonus: float = 0.05
     extra_pred_penalty: float = 0.2
-    sanity: float = 0.5  # multiplier on ground penalty (subtracted)
-    class_match: float = 0.5  # det_object only
+    sanity: float = 0.5
+    class_match: float = 0.5
+    # Linear "approach" reward used when IoU is 0 but a match exists via the
+    # centre-distance fallback. Gives the policy a smooth gradient toward the
+    # GT centre even when far away, instead of a flat floor it can exploit.
+    approach_scale: float = 30.0  # metres at which approach reward hits 0
+    approach_weight: float = 0.6
 
 
 def compute_reward(
@@ -276,17 +343,30 @@ def compute_reward(
     if n_match == 0:
         return -float(weights.miss) * 0.5 + float(weights.format_bonus), info
 
-    bev_terms, center_terms, heading_terms = [], [], []
-    for pi, gj, _ in matches:
+    bev_terms, center_terms, heading_terms, approach_terms = [], [], [], []
+    for pi, gj, score in matches:
         p, g = preds[pi], gts[gj]
         sw = safety_weight(g)
-        bev_terms.append(sw * bev_iou(p, g))
+        iou_raw = bev_iou(p, g)
+        bev_terms.append(sw * iou_raw)
         center_terms.append(sw * center_reward(p, g))
-        heading_terms.append(heading_reward(p, g))
+        # Heading only meaningful when there's at least some overlap; for
+        # fallback-only matches the model hasn't even found the object yet.
+        if iou_raw > 0:
+            heading_terms.append(heading_reward(p, g))
+        else:
+            heading_terms.append(0.0)
+        # Linear approach reward in metres-space — always non-zero, smoothly
+        # decreasing with centre distance. This is what gives the policy a
+        # gradient when IoU=0 but ALSO discourages the "just emit any box"
+        # exploit (the closer you are, the more reward you get).
+        err = float(np.linalg.norm(box_center(p) - box_center(g)))
+        approach_terms.append(max(0.0, 1.0 - err / weights.approach_scale))
 
     bev = float(np.mean(bev_terms))
     cen = float(np.mean(center_terms))
     hed = float(np.mean(heading_terms))
+    app = float(np.mean(approach_terms))
 
     # Ground sanity over all predictions (penalise hallucinated underground boxes).
     ground = float(np.mean([ground_penalty(p) for p in preds]))
@@ -294,6 +374,7 @@ def compute_reward(
     info["bev_iou"] = bev
     info["center"] = cen
     info["heading"] = hed
+    info["approach"] = app
     info["missed"] = max(0, len(gts) - n_match)
     info["extra"] = max(0, len(preds) - n_match)
     info["ground_pen"] = ground
@@ -302,6 +383,7 @@ def compute_reward(
         weights.bev_iou * bev
         + weights.center * cen
         + weights.heading * hed
+        + weights.approach_weight * app
         + weights.format_bonus
         - weights.miss * (info["missed"] / max(1, len(gts)))
         - weights.extra_pred_penalty * (info["extra"] / max(1, len(preds)))
