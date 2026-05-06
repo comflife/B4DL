@@ -52,6 +52,15 @@ from qwen_mm import (  # noqa: E402
 class ModelArguments:
     model_name_or_path: str = field(default="Qwen/Qwen3-0.6B")
     mm_input_dim: int = field(default=512)
+    mm_pos_dim: int = field(
+        default=0,
+        metadata={
+            "help": "If >0, build a positional projector that adds "
+            "Linear(mm_pos_dim, hidden) of each token's xyz to the feature "
+            "embedding. Set to 3 for VoxelNeXt-style (feat, xyz) blobs; "
+            "leave 0 for SMAP-style 12-view features."
+        },
+    )
     pretrain_mm_projector: Optional[str] = field(
         default=None,
         metadata={"help": "Path to a stage-1a mm_projector.bin to load before training."},
@@ -127,33 +136,62 @@ def add_special_tokens_and_resize(tokenizer, model: MMQwen):
 
 
 def freeze_llm_except_projector(model: MMQwen, num_added_tokens: int):
-    """Stage 1a: freeze everything except mm_projector and the rows of the
-    embedding/lm_head that correspond to the newly-added special tokens.
-
-    We can't easily mark only specific rows of an Embedding as trainable, so
-    we make the whole embedding/lm_head trainable but with zeroed grads
-    elsewhere via a hook is overkill — instead we keep them frozen and rely
-    on the fact that the projector + the response tokens (which use existing
-    Qwen vocabulary) already give a usable signal. This matches the LLaVA
-    stage-1 recipe.
+    """Stage 1a: freeze everything except `mm_projector` (and `pos_projector`
+    when configured). Embedding/lm_head rows for the new special tokens are
+    left frozen — same trade-off as the original LLaVA stage-1 recipe.
     """
     for p in model.parameters():
         p.requires_grad = False
     for p in model.mm_projector.parameters():
         p.requires_grad = True
+    if getattr(model, "pos_projector", None) is not None:
+        for p in model.pos_projector.parameters():
+            p.requires_grad = True
 
 
 def load_mm_projector(model: MMQwen, path: str):
+    """Load both the feature projector and (when present) the positional
+    projector from a stage-1a checkpoint. The on-disk format may be:
+      - raw `mm_projector.state_dict()` only (legacy SMAP)
+      - `{ "mm_projector.weight": ..., "mm_projector.bias": ...,
+           "pos_projector.weight": ..., "pos_projector.bias": ... }`
+    We tolerate either layout."""
     sd = torch.load(path, map_location="cpu")
-    # Accept either a raw projector state_dict or a wrapped {mm_projector.X: ...}.
-    if any(k.startswith("mm_projector.") for k in sd):
-        sd = {k.split("mm_projector.")[1]: v for k, v in sd.items() if k.startswith("mm_projector.")}
-    missing, unexpected = model.mm_projector.load_state_dict(sd, strict=True)
-    print(f"[sft] loaded mm_projector from {path} (missing={missing}, unexpected={unexpected})")
+
+    feat_sd = {}
+    pos_sd = {}
+    legacy = True
+    for k, v in sd.items():
+        if k.startswith("mm_projector."):
+            feat_sd[k.split("mm_projector.", 1)[1]] = v
+            legacy = False
+        elif k.startswith("pos_projector."):
+            pos_sd[k.split("pos_projector.", 1)[1]] = v
+            legacy = False
+    if legacy:
+        feat_sd = sd
+
+    feat_missing, feat_unexpected = model.mm_projector.load_state_dict(feat_sd, strict=True)
+    print(f"[sft] loaded mm_projector from {path} "
+          f"(missing={feat_missing}, unexpected={feat_unexpected})")
+    if pos_sd:
+        if model.pos_projector is None:
+            print(f"[sft] WARNING: ckpt has pos_projector but model.mm_pos_dim=0 — skipping")
+        else:
+            pmiss, punexp = model.pos_projector.load_state_dict(pos_sd, strict=True)
+            print(f"[sft] loaded pos_projector (missing={pmiss}, unexpected={punexp})")
 
 
 def save_mm_projector(model: MMQwen, output_dir: str):
-    torch.save(model.mm_projector.state_dict(), Path(output_dir) / "mm_projector.bin")
+    """Save both projectors with `mm_projector.X` / `pos_projector.X` keys
+    so `load_mm_projector` can restore them in any later stage."""
+    out = {}
+    for k, v in model.mm_projector.state_dict().items():
+        out[f"mm_projector.{k}"] = v
+    if model.pos_projector is not None:
+        for k, v in model.pos_projector.state_dict().items():
+            out[f"pos_projector.{k}"] = v
+    torch.save(out, Path(output_dir) / "mm_projector.bin")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +223,22 @@ def main():
             model_args.mm_input_dim, model.config.hidden_size
         ).to(dtype)
     model.config.mm_input_dim = model_args.mm_input_dim
+
+    # Positional projector (VoxelNeXt path). Build if requested even when
+    # not present in the loaded checkpoint, and rebuild if dim changed.
+    model.mm_pos_dim = int(model_args.mm_pos_dim)
+    model.config.mm_pos_dim = model.mm_pos_dim
+    if model.mm_pos_dim > 0:
+        need_new = (
+            model.pos_projector is None
+            or model.pos_projector.in_features != model.mm_pos_dim
+        )
+        if need_new:
+            model.pos_projector = nn.Linear(
+                model.mm_pos_dim, model.config.hidden_size
+            ).to(dtype)
+    else:
+        model.pos_projector = None
 
     n_added = add_special_tokens_and_resize(tokenizer, model)
     model.coord_aux_weight = float(model_args.coord_aux_weight)

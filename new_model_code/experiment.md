@@ -455,6 +455,139 @@ from ~25% (text) to 60–75%.
 | Latest eval JSONLs | `/tmp/q3d_logs/eval_sft1b_500.jsonl`, `eval_grpo100_500.jsonl` |
 | SMAP features | `/data1/byounggun/3davs_b4dl/features/smap_lidar12/*.pt` |
 
+## VoxelNeXt encoder swap — environment + code ready (NOT YET RUN)
+
+The diagnosis above ("Why we trail LiDAR-LLM") points the finger squarely
+at our encoder: SMAP collapses every LiDAR scene into 12 polar-pooled
+vectors, so the LLM has no spatial map to attend to when it has to
+localise from text. The plan is to replace it with **VoxelNeXt** sparse
+voxel queries — each token is a real (xyz, 128-d feature) pair drawn
+from the detector's last sparse-conv layer — and re-run the same
+SFT/GRPO recipe on top.
+
+Everything below has been wired up and smoke-tested. **No real training
+or full extraction has been launched yet.**
+
+### Environment
+
+Dedicated conda env at `/data1/byounggun/conda_envs/voxelnext`:
+
+| Package | Version | Notes |
+|--|--|--|
+| python | 3.10 | |
+| torch | 2.4.1+cu121 | matches qwen_mm env |
+| spconv-cu121 | 2.3.8 | **cu121 — cu120 segfaults silently in our setup** |
+| cumm-cu121 | 0.7.11 | follows spconv |
+| cuda-nvcc / cuda-cccl | 12.1 | conda-forge nvidia channel |
+| kornia | 0.6.12 | pinned <0.7 (newer breaks pcdet's argo2 imports) |
+| av2 | latest | Argoverse2 reader (pcdet imports it eagerly) |
+| pcdet | 0.6.0+b5b7d39 | `pip install -e /data1/byounggun/voxelnext_work/VoxelNeXt --no-build-isolation` |
+| nuscenes-devkit | 1.1.11 | for the 10-sweep loader |
+| matplotlib | 3.10.9 | upgraded past nuscenes-devkit's pin so pcdet's pruning_block.py imports |
+
+Sequence to recreate (idempotent):
+
+```bash
+conda create -p /data1/byounggun/conda_envs/voxelnext python=3.10 -y
+conda activate /data1/byounggun/conda_envs/voxelnext
+pip install --upgrade pip
+pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+pip install spconv-cu121 numpy easydict pyyaml numba llvmlite tqdm scikit-image SharedArray opencv-python tensorboardX nuscenes-devkit pyquaternion av2 "kornia<0.7" matplotlib gdown
+conda install -y -c nvidia cuda-nvcc=12.1 cuda-cudart-dev=12.1 cuda-libraries-dev=12.1 cuda-runtime=12.1 cuda-cccl=12.1 cuda-nvrtc=12.1 cuda-nvrtc-dev=12.1
+cd /data1/byounggun/voxelnext_work/VoxelNeXt && pip install --no-build-isolation -e .
+```
+
+Pretrained checkpoint: `/data1/byounggun/voxelnext_work/ckpt/voxelnext_nuscenes_kernel1.pth`
+(32 MB, gdown id `1IV7e7G9X-61KXSjMGtQo579pzDNbhwvf`, mAP 60.5 / NDS 66.6 on nuScenes val).
+
+### Code
+
+| File | What changed |
+|--|--|
+| `extract_voxelnext_features.py` (new) | 10-sweep loader + spconv `PointToVoxel` voxelizer + `_DummyDataset` so `build_network` works without a real OpenPCDet dataset + per-sample top-K=256 voxel selection |
+| `qwen_mm/model.py` | `MMQwen` now has an optional `pos_projector: Linear(mm_pos_dim, hidden)` controlled by `config.mm_pos_dim`. `_project_images` recognises a list-of-dicts (`{feat, xyz, mask}`) input and routes through both projectors with mask-based length per sample. `_xyz_norm_scale` (default `[54, 54, 5]`) normalises xyz to ~[-1, 1] before the pos projector. Buffer is non-persistent so checkpoints don't ship it. |
+| `qwen_mm/data.py` | `_load_lidar_feat` (alias preserves `_load_smap_feat`) returns a tensor for SMAP blobs and a dict for VoxelNeXt blobs. SMAPDataset / Collator are unchanged otherwise. |
+| `train_qwen_sft.py` | `ModelArguments.mm_pos_dim` flag (default 0). After loading the base Qwen3 checkpoint we (re)build `mm_projector` and `pos_projector` to match the requested dims. `save_mm_projector` / `load_mm_projector` now serialise both projectors with `mm_projector.X` / `pos_projector.X` prefixes; the loader is also backward-compatible with the legacy "raw projector state-dict" layout from the SMAP runs. |
+| `scripts/stage1a_voxelnext.sh` (new) | mm_input_dim=128, mm_pos_dim=3, FEAT_DIR=`voxelnext_q256`, OUT_DIR=`qwen_stage1a_vxnxt`, otherwise mirrors the SMAP stage 1a recipe. |
+| `scripts/stage1b_voxelnext.sh` (new) | Loads the warmed projectors from stage 1a, mm_pos_dim=3, batch 4×grad_accum 4, otherwise the SMAP 1b recipe. |
+| `scripts/stage2_grpo_voxelnext.sh` (new) | Points GRPO at the VoxelNeXt SFT-1b dir + voxelnext feature folder, uses the "safer" hp set (lr 5e-6, kl_coef 0.20). |
+| `smoke_voxelnext_pipeline.py` (new) | Synthetic blob → MMQwen forward + backward + generate. Confirms feat-grad and pos-grad both flow. |
+
+### Verified
+
+- **VoxelNeXt model load + forward** (run from `voxelnext` env on synthetic 20k points):
+  ```
+  encoded_spconv: features=torch.Size([10609, 128]) indices=torch.Size([10609, 3])
+  score min/max = 0.0013 .. 0.3175
+  ALL OK
+  ```
+  i.e., the backbone, dense head, and per-class hm scores are all alive
+  and on GPU.
+
+- **MMQwen forward + backward + generate on a synthetic VoxelNeXt blob**
+  (run from `qwen_mm` env via `smoke_voxelnext_pipeline.py`):
+  ```
+  forward+backward ok | loss=16.78 feat_grad_norm=169.10 pos_grad_norm=11.12
+  generate ok | n_new=20
+  ALL OK
+  ```
+  Both projectors receive non-zero gradients, splice produces the right
+  shape, and `model.generate(..., images=[blob])` runs to completion.
+
+### Storage / runtime estimates
+
+| Item | Estimate |
+|--|--|
+| Per-sample blob size | (256 * 128 + 256 * 3) * 2 B fp16 + small headers ≈ 67 KB |
+| Total feature folder for ~34 k scenes | ≈ 2.3 GB (vs 1.0 GB for SMAP-12) |
+| Single-GPU extract speed | ~5 it/s (estimate) → ~2 h for full set |
+| Stage 1a (VoxelNeXt) runtime | similar to SMAP 1a (~64 min on 2× A6000), trainable param count slightly higher because both projectors are trained |
+| Stage 1b (VoxelNeXt) runtime | likely **2-3× longer** than SMAP 1b — each sample is 256 splice tokens vs 12, so attn is ~20× more compute per LiDAR token segment. Expect 4-5 h on 2× A6000 with batch 4 × grad_accum 4. Tunable by reducing K. |
+
+### To launch (when ready)
+
+```bash
+# 1) Extract VoxelNeXt features (voxelnext env, GPU 0)
+source /home/byounggun/anaconda3/etc/profile.d/conda.sh
+conda activate /data1/byounggun/conda_envs/voxelnext
+CUDA_VISIBLE_DEVICES=0 python -u /home/byounggun/B4DL/new_model_code/extract_voxelnext_features.py \
+    --nuscenes_root /data/nuscenes \
+    --token_list /home/byounggun/B4DL/new_model_code/sample_tokens_union.json \
+    --ckpt /data1/byounggun/voxelnext_work/ckpt/voxelnext_nuscenes_kernel1.pth \
+    --save_dir /data1/byounggun/3davs_b4dl/features/voxelnext_q256 \
+    --top_k 256
+
+# 2) Stage 1a (qwen_mm env, GPUs 0,1)
+GPUS=0,1 bash /home/byounggun/B4DL/new_model_code/scripts/stage1a_voxelnext.sh
+
+# 3) Stage 1b (qwen_mm env)
+GPUS=0,1 bash /home/byounggun/B4DL/new_model_code/scripts/stage1b_voxelnext.sh
+
+# 4) Stage 2 GRPO (qwen_mm env, single GPU)
+GPU=0 bash /home/byounggun/B4DL/new_model_code/scripts/stage2_grpo_voxelnext.sh
+
+# 5) Eval
+CUDA_VISIBLE_DEVICES=1 python -u /home/byounggun/B4DL/new_model_code/eval_q3d.py \
+    --sft_dir /data1/byounggun/3davs_b4dl/checkpoints/qwen_stage1b_vxnxt \
+    --max_samples 500
+```
+
+### Open questions / risks
+
+- **Score quality**: with synthetic random points the score range was
+  [0.001, 0.317]. On real LiDAR we expect a much sharper distribution
+  (top voxels >0.5 for clear vehicles). Worth eyeballing the histogram
+  on the first 100 real scenes during extraction.
+- **K=256 sufficiency**: VoxelNeXt's nuScenes config keeps thousands of
+  voxels post-SVP. Top-256 should cover all real objects (typically
+  <100 per scene) but if extraction reports voxels < 256 frequently
+  (mask coverage reported per-blob), we may want to drop K to 128 to
+  trim the LLM sequence.
+- **Coord aux weight under K=256**: with longer sequences the relative
+  weight of the per-axis L1 may need re-tuning. Stage 1b script uses
+  the same 0.5 as SMAP for now; revisit if loss starts dominated by
+  caption CE.
+
 ## Next session — pick up here
 
 Priority order:

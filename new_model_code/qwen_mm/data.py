@@ -31,12 +31,45 @@ BOX_END = "<|box_end|>"
 SPECIAL_TOKENS = [IMAGE_PLACEHOLDER, BOX_START, BOX_END]
 
 
-def _load_smap_feat(feat_dir: Path, scene_id: str) -> torch.Tensor:
+def _load_lidar_feat(feat_dir: Path, scene_id: str):
+    """Load a per-scene LiDAR feature blob.
+
+    Two on-disk layouts are supported transparently:
+
+    * **SMAP** (`{"output_smap": (1, n_views, dim)}`): returned as a plain
+      `(n_views, dim)` float tensor — original pre-VoxelNeXt path.
+    * **VoxelNeXt** (`{"feat": (K, dim), "xyz": (K, 3), "mask": (K,) bool, ...}`):
+      returned as a dict with feat/xyz/mask. Score and cls fields, when
+      present, are ignored downstream.
+
+    Returning a dict for VoxelNeXt makes `MMQwen._project_images` route
+    to the spatial-aware projector path that adds a per-token positional
+    embedding.
+    """
     blob = torch.load(feat_dir / f"{scene_id}.pt", map_location="cpu")
-    feat = blob["output_smap"]
-    if feat.dim() == 3:
-        feat = feat.squeeze(0)
-    return feat.float()  # (n_views, smap_dim)
+    if "output_smap" in blob:
+        feat = blob["output_smap"]
+        if feat.dim() == 3:
+            feat = feat.squeeze(0)
+        return feat.float()
+    if "feat" in blob:
+        out = {
+            "feat": blob["feat"].float(),
+            "xyz": blob["xyz"].float(),
+        }
+        if "mask" in blob:
+            out["mask"] = blob["mask"].bool()
+        else:
+            out["mask"] = torch.ones(out["feat"].shape[0], dtype=torch.bool)
+        return out
+    raise RuntimeError(
+        f"Unrecognised feature blob at {feat_dir}/{scene_id}.pt — expected "
+        "either SMAP ('output_smap') or VoxelNeXt ('feat') keys."
+    )
+
+
+# Backwards-compat alias: callers still using the old name keep working.
+_load_smap_feat = _load_lidar_feat
 
 
 class SMAPDataset(Dataset):

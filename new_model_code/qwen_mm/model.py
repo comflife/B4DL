@@ -48,6 +48,26 @@ class MMQwen(Qwen3ForCausalLM):
         self.image_token_id: Optional[int] = getattr(config, "image_token_id", None)
         self.mm_projector = nn.Linear(self.mm_input_dim, config.hidden_size)
 
+        # Optional positional projector for VoxelNeXt-style features that
+        # carry a per-token (x, y, z) location. When `mm_pos_dim > 0` each
+        # token embedding becomes `mm_projector(feat) + pos_projector(xyz_norm)`,
+        # giving the LLM an explicit spatial signal alongside the content
+        # vector. SMAP-style features (no per-token xyz) leave this disabled.
+        self.mm_pos_dim: int = int(getattr(config, "mm_pos_dim", 0))
+        if self.mm_pos_dim > 0:
+            self.pos_projector = nn.Linear(self.mm_pos_dim, config.hidden_size)
+        else:
+            self.pos_projector = None
+        # Hard-coded normalisation range for xyz inputs. nuScenes VoxelNeXt
+        # uses [-54, 54] xy and [-5, 3] z; we normalise to [-1, 1] for both
+        # projector stability and so the model isn't forced to learn the
+        # absolute scale at the same time as semantics.
+        self.register_buffer(
+            "_xyz_norm_scale",
+            torch.tensor(getattr(config, "mm_xyz_scale", [54.0, 54.0, 5.0]), dtype=torch.float32),
+            persistent=False,
+        )
+
         # Q3D coord-vocab metadata. `set_coord_vocab` populates these after
         # tokenizer surgery; defaults keep checkpoint loading cheap.
         self.coord_token_min: Optional[int] = getattr(config, "coord_token_min", None)
@@ -211,9 +231,46 @@ class MMQwen(Qwen3ForCausalLM):
     # Splicing helper.
     # ------------------------------------------------------------------
     def _project_images(
-        self, images: Union[List[torch.Tensor], torch.Tensor]
+        self, images
     ) -> List[torch.Tensor]:
+        """Project per-sample LiDAR features into the LM hidden space.
+
+        Two input layouts are supported:
+
+        1. **SMAP-style** — `images` is a list/tensor of `(N, mm_input_dim)`
+           feature vectors (one per "view"). Each becomes a row that we
+           pass through `mm_projector`. Backwards compatible with the
+           pre-VoxelNeXt pipeline.
+        2. **VoxelNeXt-style** — `images` is a list of dicts:
+               {"feat": (K, mm_input_dim), "xyz": (K, 3), "mask": (K,) bool}
+           In this layout each token gets `mm_projector(feat) +
+           pos_projector(xyz_norm)`, where `mask=False` rows are dropped
+           before splicing so the LLM only attends to *real* voxels.
+           This is the spatial-aware path; enabled when `mm_pos_dim > 0`
+           and the entries are dicts with a `feat` key.
+        """
         target_dtype = self.mm_projector.weight.dtype
+
+        # VoxelNeXt-style: list of dicts per-sample.
+        if isinstance(images, (list, tuple)) and len(images) > 0 and isinstance(images[0], dict):
+            out = []
+            for blob in images:
+                feat = blob["feat"].to(target_dtype).to(self.device)
+                xyz = blob["xyz"].to(target_dtype).to(self.device)
+                mask = blob.get("mask")
+                if mask is not None:
+                    mask = mask.to(self.device).bool()
+                    feat = feat[mask]
+                    xyz = xyz[mask]
+                tok = self.mm_projector(feat)
+                if self.pos_projector is not None and xyz.shape[0] > 0:
+                    scale = self._xyz_norm_scale.to(target_dtype).to(self.device)
+                    xyz_n = (xyz / scale).clamp(-1.5, 1.5)
+                    tok = tok + self.pos_projector(xyz_n)
+                out.append(tok)
+            return out
+
+        # SMAP-style fallback (original pre-VoxelNeXt behaviour).
         if isinstance(images, (list, tuple)):
             return [
                 self.mm_projector(img.to(target_dtype).to(self.device))
