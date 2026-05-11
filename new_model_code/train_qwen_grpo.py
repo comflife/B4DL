@@ -1,13 +1,17 @@
-"""Custom GRPO fine-tuner for the Qwen3-0.6B + SMAP MM model on nuGrounding.
+"""Custom GRPO fine-tuner for the Qwen3.5-9B + joint VoxelNeXt model on
+nuGrounding.
 
 Design (matches the earlier Llama version, ported to MMQwen):
 
   * Policy = stage-1b SFT model + a fresh LoRA adapter (trainable).
   * Reference = the same backbone with `disable_adapter()` (no second copy).
-  * For each prompt: K rollouts via model.generate(images=...).
+  * For each prompt: K rollouts via model.generate(points=...).
   * Group-normalised advantages (GRPO baseline) + KL to reference.
   * Per-token NLL is computed by re-running model(forward) over
     [prompt | rollout] tokens; gradients flow only through the rollout span.
+
+Raw 10-sweep LiDAR is loaded by load_keyframe_with_sweeps, encoded by the
+in-model frozen VoxelNeXt, then spliced as voxel-query tokens.
 
 Reward is the LiDAR-aware composite from rewards_lidar.compute_reward, with
 `template_type` propagated from each sample so det_object falls back to
@@ -41,7 +45,7 @@ from qwen_mm import (  # noqa: E402
     IMAGE_PLACEHOLDER,
     MMQwen,
 )
-from qwen_mm.data import _load_smap_feat  # noqa: E402
+from qwen_mm.data import load_keyframe_with_sweeps  # noqa: E402
 from rewards_lidar import compute_reward  # noqa: E402
 
 
@@ -49,10 +53,15 @@ from rewards_lidar import compute_reward  # noqa: E402
 @dataclass
 class GRPOConfig:
     output_dir: str
-    base_model: str  # original Qwen3 path, used only for tokenizer if no SFT
+    base_model: str  # original Qwen3.5 path, used only for tokenizer if no SFT
     sft_dir: str  # Stage-1b SFT output (model + tokenizer + projector)
-    feat_folder: str
-    data_path: str
+    nuscenes_root: str
+    nuscenes_version: str = "v1.0-trainval"
+    n_sweeps: int = 10
+    voxelnext_root: Optional[str] = None
+    voxelnext_ckpt: Optional[str] = None
+    voxelnext_top_k: int = 256
+    data_path: str = ""
     sample_ratio: float = 0.25
     num_rollouts: int = 4
     gradient_accumulation_steps: int = 4
@@ -94,13 +103,13 @@ def compute_response_logp(
     model: MMQwen,
     input_ids: torch.Tensor,
     response_ids: torch.Tensor,
-    image_feats: torch.Tensor,
+    points: torch.Tensor,
 ) -> torch.Tensor:
     """sum_{t in response} log pi(t | prefix). Returns shape (1,)."""
     full_ids = torch.cat([input_ids, response_ids], dim=1)
     out = model(
         input_ids=full_ids,
-        images=[image_feats.to(full_ids.device)],
+        points=[points.to(full_ids.device)],
         use_cache=False,
         return_dict=True,
     )
@@ -182,16 +191,32 @@ class GRPOTrainer:
         self.data = data[:n]
         print(f"[grpo] sampled {len(self.data)} of {n} (ratio={cfg.sample_ratio})")
 
-        self.feat_folder = Path(cfg.feat_folder)
+        # Joint VoxelNeXt encoder + nuScenes API for raw LiDAR loading.
+        if cfg.voxelnext_root and cfg.voxelnext_ckpt:
+            print(f"[grpo] init VoxelNeXt: {cfg.voxelnext_ckpt} top_k={cfg.voxelnext_top_k}")
+            # `self.model` is currently a PeftModel wrapping MMQwen.
+            base = self.model.base_model.model if hasattr(self.model, "base_model") else self.model
+            base.init_voxelnext(
+                voxelnext_root=cfg.voxelnext_root,
+                ckpt_path=cfg.voxelnext_ckpt,
+                top_k=cfg.voxelnext_top_k,
+                freeze=True,
+            )
+
+        from nuscenes.nuscenes import NuScenes
+        print(f"[grpo] loading nuScenes {cfg.nuscenes_version} from {cfg.nuscenes_root}")
+        self.nusc = NuScenes(
+            version=cfg.nuscenes_version, dataroot=cfg.nuscenes_root, verbose=False
+        )
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _rollout(self, input_ids, image_feat) -> List[torch.Tensor]:
+    def _rollout(self, input_ids, points) -> List[torch.Tensor]:
         rollouts = []
         for _ in range(self.cfg.num_rollouts):
             out = self.model.generate(
                 input_ids=input_ids,
-                images=[image_feat.cuda()],
+                points=[points.cuda()],
                 do_sample=True,
                 temperature=self.cfg.temperature,
                 top_p=self.cfg.top_p,
@@ -213,11 +238,14 @@ class GRPOTrainer:
 
     # ------------------------------------------------------------------
     def _step(self, sample: dict):
-        scene_id = sample.get("scene_id") or sample.get("sample_token")
+        scene_id = sample.get("sample_token") or sample.get("scene_id")
         try:
-            feat = _load_smap_feat(self.feat_folder, scene_id)
+            pts_np = load_keyframe_with_sweeps(self.nusc, scene_id, self.cfg.n_sweeps)
+            if pts_np is None or pts_np.shape[0] == 0:
+                return None, {"skip_reason": "empty_points"}
+            points = torch.from_numpy(pts_np)
         except Exception as e:
-            return None, {"skip_reason": f"feat_load:{e}"}
+            return None, {"skip_reason": f"points_load:{e}"}
 
         question = sample["conversations"][0]["value"]
         gt_answer = sample["conversations"][1]["value"]
@@ -229,7 +257,7 @@ class GRPOTrainer:
 
         # Rollouts (no grad).
         self.model.eval()
-        rollouts = self._rollout(input_ids, feat)
+        rollouts = self._rollout(input_ids, points)
         decoded = [
             self.tokenizer.decode(r[0], skip_special_tokens=False) for r in rollouts
         ]
@@ -251,7 +279,7 @@ class GRPOTrainer:
         self.model.train()
         logp_pol = []
         for r in rollouts:
-            lp = compute_response_logp(self.model, input_ids, r, feat)
+            lp = compute_response_logp(self.model, input_ids, r, points)
             logp_pol.append(lp)
         logp_pol = torch.stack(logp_pol).squeeze(-1)  # (K,)
 
@@ -259,7 +287,7 @@ class GRPOTrainer:
             with self.model.disable_adapter():
                 logp_ref = []
                 for r in rollouts:
-                    lp = compute_response_logp(self.model, input_ids, r, feat)
+                    lp = compute_response_logp(self.model, input_ids, r, points)
                     logp_ref.append(lp)
                 logp_ref = torch.stack(logp_ref).squeeze(-1)  # (K,)
 
@@ -287,6 +315,34 @@ class GRPOTrainer:
         out = Path(self.cfg.output_dir)
         out.mkdir(parents=True, exist_ok=True)
         log_f = open(out / "train_log.jsonl", "a")
+
+        # Optional wandb. Activate by exporting WANDB_PROJECT (and the
+        # usual WANDB_API_KEY). We won't error if wandb isn't installed
+        # or login is missing -- the JSONL log is the source of truth.
+        wb = None
+        if os.environ.get("WANDB_PROJECT") or os.environ.get("WANDB_API_KEY"):
+            try:
+                import wandb as _wandb
+                _wandb.init(
+                    project=os.environ.get("WANDB_PROJECT", "b4dl-grpo"),
+                    name=os.environ.get("WANDB_RUN_NAME", "qwen_stage2_grpo_vxnxt"),
+                    config={
+                        k: getattr(self.cfg, k)
+                        for k in (
+                            "base_model", "sft_dir", "data_path",
+                            "sample_ratio", "num_rollouts", "gradient_accumulation_steps",
+                            "max_prompt_len", "max_new_tokens",
+                            "temperature", "top_p", "learning_rate", "kl_coef",
+                            "epochs", "lora_r", "lora_alpha", "voxelnext_top_k",
+                        )
+                    },
+                    dir=str(out),
+                )
+                wb = _wandb
+                print(f"[grpo] wandb logging -> {wb.run.url if wb.run else '(no url)'}")
+            except Exception as e:
+                print(f"[grpo] wandb disabled: {e}")
+        self._wb = wb
 
         # Rolling window of per-prompt info dicts, sized so each log line
         # averages over `gradient_accumulation_steps * log_every` prompts
@@ -354,6 +410,12 @@ class GRPOTrainer:
                         )
                         log_f.write(json.dumps(avg) + "\n")
                         log_f.flush()
+                        if self._wb is not None:
+                            self._wb.log(
+                                {f"grpo/{k}": v for k, v in avg.items()
+                                 if isinstance(v, (int, float))},
+                                step=global_step,
+                            )
 
                     if global_step % self.cfg.save_every == 0:
                         ck = out / f"step_{global_step}"
@@ -363,27 +425,49 @@ class GRPOTrainer:
 
         self.model.save_pretrained(out / "final")
         log_f.close()
+        if self._wb is not None:
+            try:
+                self._wb.finish()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base_model", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--base_model", default="Qwen/Qwen3.5-9B")
+    _data_root = os.environ.get("DATA_ROOT", "/data1/byounggun/3davs_b4dl")
     ap.add_argument(
         "--sft_dir",
-        default="/data1/byounggun/3davs_b4dl/checkpoints/qwen_stage1b",
+        default=f"{_data_root}/checkpoints/qwen_stage1b_vxnxt",
     )
     ap.add_argument(
-        "--feat_folder",
-        default="/data1/byounggun/3davs_b4dl/features/smap_lidar12",
+        "--nuscenes_root",
+        default=os.environ.get("NUSCENES_ROOT", f"{_data_root}/nuscenes"),
     )
+    ap.add_argument("--nuscenes_version", default="v1.0-trainval")
+    ap.add_argument("--n_sweeps", type=int, default=10)
+    ap.add_argument(
+        "--voxelnext_root",
+        default=os.environ.get(
+            "VOXELNEXT_ROOT", f"{_data_root}/voxelnext_work/VoxelNeXt"
+        ),
+    )
+    ap.add_argument(
+        "--voxelnext_ckpt",
+        default=os.environ.get(
+            "VOXELNEXT_CKPT",
+            f"{_data_root}/voxelnext_work/ckpt/voxelnext_nuscenes_kernel1.pth",
+        ),
+    )
+    ap.add_argument("--voxelnext_top_k", type=int, default=256)
     ap.add_argument(
         "--data_path",
-        default="/home/byounggun/B4DL/3dtesting_dataset/train.json",
+        default=f"{_data_root}/data/3dtesting_train_q3d.json",
     )
     ap.add_argument(
         "--output_dir",
-        default="/data1/byounggun/3davs_b4dl/checkpoints/qwen_stage2_grpo",
+        default=f"{_data_root}/checkpoints/qwen_stage2_grpo_vxnxt",
     )
     ap.add_argument("--sample_ratio", type=float, default=0.25)
     ap.add_argument("--num_rollouts", type=int, default=4)
@@ -408,7 +492,12 @@ def main():
     cfg = GRPOConfig(
         base_model=args.base_model,
         sft_dir=args.sft_dir,
-        feat_folder=args.feat_folder,
+        nuscenes_root=args.nuscenes_root,
+        nuscenes_version=args.nuscenes_version,
+        n_sweeps=args.n_sweeps,
+        voxelnext_root=args.voxelnext_root,
+        voxelnext_ckpt=args.voxelnext_ckpt,
+        voxelnext_top_k=args.voxelnext_top_k,
         data_path=args.data_path,
         output_dir=args.output_dir,
         sample_ratio=args.sample_ratio,

@@ -1,34 +1,44 @@
-"""Qwen3 + 3D-AVS SMAP LiDAR feature multimodal training package.
+"""Qwen3.5-9B + joint VoxelNeXt LiDAR encoder multimodal training package.
 
-Replaces the Vicuna/VTimeLLM-based pipeline with a self-contained Qwen3-0.6B
-wrapper. Components:
+Components:
 
-  model.MMQwen      Qwen3ForCausalLM subclass with a Linear projector that
-                    converts SMAP feature tokens (12, 512) into hidden-dim
-                    embeddings spliced at the position of <image> in input_ids.
+  model.MMQwen          Qwen3_5ForCausalLM subclass with a Linear projector
+                        that maps VoxelNeXt voxel-query tokens (K, 128)
+                        plus their (K, 3) xyz into hidden-dim embeddings,
+                        spliced at the position of <image> in input_ids.
+                        Holds the pcdet VoxelNeXt encoder (frozen) inside
+                        — call MMQwen.init_voxelnext(...) after loading.
 
-  data.SMAPDataset  Loads stage1_combined.json, applies Qwen ChatML template,
-                    masks user-side tokens with -100, returns paired LiDAR
-                    feature.
+  data.LiDARMMDataset   Loads ChatML conversations + raw 10-sweep LiDAR
+                        per nuScenes sample_token via the nuScenes API.
+                        The encoder runs inside the model, so the dataset
+                        needs neither a feat_folder nor pre-extracted .pt
+                        blobs.
 
-  data.Collator     Right-pads variable-length sequences and keeps the per-
-                    sample image feature as a list (so MMQwen.forward can
-                    splice each one independently).
+  data.Collator         Right-pads variable-length text. Keeps the per-
+                        sample point cloud as a Python list so MMQwen's
+                        joint forward can encode each independently.
 
-The image placeholder token is "<image>" (kept identical to the upstream
-B4DL data so we don't have to rewrite the JSON). It is registered as an
-additional special token at training time so it always tokenises to a
-single id, regardless of subword behaviour.
+The image placeholder token is "<image>", registered as an additional
+special token at training time so it always tokenises to a single id.
 """
 
-from .data import IMAGE_PLACEHOLDER, BOX_START, BOX_END, Collator, SMAPDataset
+from .data import (
+    IMAGE_PLACEHOLDER,
+    BOX_START,
+    BOX_END,
+    Collator,
+    LiDARMMDataset,
+    SMAPDataset,
+)
 from .model import MMQwen, MMQwenConfig
 from . import quantizer
 
 __all__ = [
     "MMQwen",
     "MMQwenConfig",
-    "SMAPDataset",
+    "LiDARMMDataset",
+    "SMAPDataset",  # backwards-compat alias
     "Collator",
     "IMAGE_PLACEHOLDER",
     "BOX_START",

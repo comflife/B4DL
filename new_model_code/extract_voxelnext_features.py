@@ -57,7 +57,12 @@ import torch
 # ---------------------------------------------------------------------------
 # Make pcdet importable. We use the JIA-Lab-research/VoxelNeXt clone.
 # ---------------------------------------------------------------------------
-VOXELNEXT_ROOT = Path("/data1/byounggun/voxelnext_work/VoxelNeXt")
+VOXELNEXT_ROOT = Path(
+    os.environ.get(
+        "VOXELNEXT_ROOT",
+        "/data1/byounggun/voxelnext_work/VoxelNeXt",
+    )
+)
 sys.path.insert(0, str(VOXELNEXT_ROOT))
 
 from easydict import EasyDict  # noqa: E402
@@ -364,21 +369,32 @@ def extract_one(
 # Main.
 # ---------------------------------------------------------------------------
 def parse_args():
+    _data_root = os.environ.get("DATA_ROOT", "/data1/byounggun/3davs_b4dl")
+    _repo_root = os.environ.get(
+        "REPO_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nuscenes_root", default="/data/nuscenes")
+    ap.add_argument(
+        "--nuscenes_root",
+        default=os.environ.get("NUSCENES_ROOT", f"{_data_root}/nuscenes"),
+    )
     ap.add_argument("--nuscenes_version", default="v1.0-trainval")
     ap.add_argument(
         "--token_list",
-        default="/home/byounggun/B4DL/new_model_code/sample_tokens_union.json",
+        default=f"{_repo_root}/new_model_code/sample_tokens_union.json",
     )
     ap.add_argument(
         "--ckpt",
-        default="/data1/byounggun/voxelnext_work/ckpt/voxelnext_nuscenes_kernel1.pth",
+        default=os.environ.get(
+            "VOXELNEXT_CKPT",
+            f"{_data_root}/voxelnext_work/ckpt/voxelnext_nuscenes_kernel1.pth",
+        ),
         help="Pretrained nuScenes VoxelNeXt checkpoint",
     )
     ap.add_argument(
         "--save_dir",
-        default="/data1/byounggun/3davs_b4dl/features/voxelnext_q256",
+        default=f"{_data_root}/features/voxelnext_q256",
     )
     ap.add_argument("--top_k", type=int, default=TOP_K)
     ap.add_argument("--n_sweeps", type=int, default=10)

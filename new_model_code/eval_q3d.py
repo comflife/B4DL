@@ -1,8 +1,9 @@
-"""Quick-look evaluator for a Q3D-trained Qwen3 + SMAP checkpoint.
+"""Quick-look evaluator for a Q3D-trained Qwen3.5 + joint VoxelNeXt checkpoint.
 
-Loads the SFT model, runs greedy generation on a held-out slice of the
-quantised val set, and reports parse rate, BEV-IoU, centre L2, heading,
-class-match (for det_object), and per-template breakdowns.
+Loads the SFT model, attaches the frozen VoxelNeXt encoder, runs greedy
+generation on a held-out slice of the quantised val set, and reports
+parse rate, BEV-IoU, centre L2, heading, class-match (for det_object),
+and per-template breakdowns.
 
 Intended as a smoke check between stage 1b and GRPO — *not* a full
 benchmark. Use --max_samples to keep runtime sane on a single GPU.
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -24,6 +26,7 @@ NEW_CODE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(NEW_CODE_DIR))
 
 from qwen_mm import MMQwen, IMAGE_PLACEHOLDER  # noqa: E402
+from qwen_mm.data import load_keyframe_with_sweeps  # noqa: E402
 from qwen_mm.quantizer import parse_quantized_boxes  # noqa: E402
 from rewards_lidar import (  # noqa: E402
     bev_iou,
@@ -54,14 +57,34 @@ SUPER5 = {
 
 
 def parse_args():
+    _data_root = os.environ.get("DATA_ROOT", "/data1/byounggun/3davs_b4dl")
     ap = argparse.ArgumentParser()
     ap.add_argument("--sft_dir", required=True,
                     help="Stage-1b checkpoint dir (output_dir from stage1b_full.sh)")
     ap.add_argument("--lora_adapter", default=None,
-                    help="Optional GRPO LoRA adapter dir (e.g., qwen_stage2_grpo_q3d/step_100). "
+                    help="Optional GRPO LoRA adapter dir (e.g., qwen_stage2_grpo_vxnxt/step_100). "
                     "Loaded on top of the SFT base via peft.")
-    ap.add_argument("--data_path", default="/data1/byounggun/3davs_b4dl/data/3dtesting_val_q3d.json")
-    ap.add_argument("--feat_folder", default="/data1/byounggun/3davs_b4dl/features/smap_lidar12")
+    ap.add_argument("--data_path", default=f"{_data_root}/data/3dtesting_val_q3d.json")
+    ap.add_argument(
+        "--nuscenes_root",
+        default=os.environ.get("NUSCENES_ROOT", f"{_data_root}/nuscenes"),
+    )
+    ap.add_argument("--nuscenes_version", default="v1.0-trainval")
+    ap.add_argument("--n_sweeps", type=int, default=10)
+    ap.add_argument(
+        "--voxelnext_root",
+        default=os.environ.get(
+            "VOXELNEXT_ROOT", f"{_data_root}/voxelnext_work/VoxelNeXt"
+        ),
+    )
+    ap.add_argument(
+        "--voxelnext_ckpt",
+        default=os.environ.get(
+            "VOXELNEXT_CKPT",
+            f"{_data_root}/voxelnext_work/ckpt/voxelnext_nuscenes_kernel1.pth",
+        ),
+    )
+    ap.add_argument("--voxelnext_top_k", type=int, default=256)
     ap.add_argument("--max_samples", type=int, default=200)
     ap.add_argument("--max_new_tokens", type=int, default=80)
     ap.add_argument("--out_jsonl", default=None,
@@ -69,18 +92,32 @@ def parse_args():
     return ap.parse_args()
 
 
-def load_model(sft_dir: str, lora_adapter: str = None):
+def load_model(
+    sft_dir: str,
+    lora_adapter: str = None,
+    voxelnext_root: str = None,
+    voxelnext_ckpt: str = None,
+    voxelnext_top_k: int = 256,
+):
     tok = AutoTokenizer.from_pretrained(sft_dir)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     model = MMQwen.from_pretrained(sft_dir, dtype=torch.bfloat16, attn_implementation="sdpa")
+    if torch.cuda.is_available():
+        model.cuda()
+    if voxelnext_root and voxelnext_ckpt:
+        print(f"[eval] init VoxelNeXt: {voxelnext_ckpt} top_k={voxelnext_top_k}")
+        model.init_voxelnext(
+            voxelnext_root=voxelnext_root,
+            ckpt_path=voxelnext_ckpt,
+            top_k=voxelnext_top_k,
+            freeze=True,
+        )
     if lora_adapter:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, lora_adapter)
         print(f"[eval] loaded LoRA adapter from {lora_adapter}")
     model.eval()
-    if torch.cuda.is_available():
-        model.cuda()
     img_id = tok.convert_tokens_to_ids(IMAGE_PLACEHOLDER)
     if img_id == tok.unk_token_id:
         raise RuntimeError("'<image>' missing from tokenizer — wrong checkpoint?")
@@ -109,15 +146,14 @@ def build_prompt(tok, conversations):
     return enc.input_ids, enc.attention_mask
 
 
-def safe_load_feat(feat_dir: Path, scene_id: str):
-    p = feat_dir / f"{scene_id}.pt"
-    if not p.exists():
+def safe_load_points(nusc, scene_id: str, n_sweeps: int = 10):
+    try:
+        pts_np = load_keyframe_with_sweeps(nusc, scene_id, n_sweeps)
+    except Exception:
         return None
-    blob = torch.load(p, map_location="cpu")
-    feat = blob["output_smap"]
-    if feat.dim() == 3:
-        feat = feat.squeeze(0)
-    return feat.float()
+    if pts_np is None or pts_np.shape[0] == 0:
+        return None
+    return torch.from_numpy(pts_np)
 
 
 def per_pair_metrics(preds, gts):
@@ -152,11 +188,21 @@ def per_pair_metrics(preds, gts):
 
 def main():
     args = parse_args()
-    feat_dir = Path(args.feat_folder)
     print(f"[eval] sft_dir = {args.sft_dir}")
     print(f"[eval] data    = {args.data_path}")
+    print(f"[eval] nuscenes_root = {args.nuscenes_root}")
 
-    model, tok = load_model(args.sft_dir, args.lora_adapter)
+    model, tok = load_model(
+        args.sft_dir,
+        args.lora_adapter,
+        voxelnext_root=args.voxelnext_root,
+        voxelnext_ckpt=args.voxelnext_ckpt,
+        voxelnext_top_k=args.voxelnext_top_k,
+    )
+    from nuscenes.nuscenes import NuScenes
+    nusc = NuScenes(
+        version=args.nuscenes_version, dataroot=args.nuscenes_root, verbose=False
+    )
     data = json.load(open(args.data_path))
     print(f"[eval] val n   = {len(data)} (using first {args.max_samples})")
 
@@ -176,9 +222,9 @@ def main():
     out_records = []
     skipped = 0
     for i, sample in enumerate(data[: args.max_samples]):
-        scene_id = sample.get("scene_id") or sample.get("sample_token")
-        feat = safe_load_feat(feat_dir, scene_id)
-        if feat is None:
+        scene_id = sample.get("sample_token") or sample.get("scene_id")
+        points = safe_load_points(nusc, scene_id, args.n_sweeps)
+        if points is None:
             skipped += 1
             continue
 
@@ -197,7 +243,7 @@ def main():
             gen = model.generate(
                 input_ids=input_ids.to(device),
                 attention_mask=attn.to(device),
-                images=[feat.to(device)],
+                points=[points.to(device)],
                 max_new_tokens=args.max_new_tokens,
                 do_sample=False,
                 pad_token_id=tok.pad_token_id,
@@ -314,6 +360,25 @@ def main():
         print(f"  det_area: mean={np.mean(car_da)*100:5.2f}  n={len(car_da)}  (true VG; LiDAR-LLM 14.3)")
     elif "car" in iou_by_class:
         print("  det_area: no det_area Car samples in this slice")
+
+    # ---- LiDAR-LLM Table 7 (Appendix A.2) reproduction -------------------
+    # 5-category Visual-Grounding mIoU. Only det_area samples count as a
+    # true VG eval — det_object echoes the input box and inflates numbers.
+    print("\n=== LiDAR-LLM Table 7 (det_area only, 5-class mIoU) ===")
+    print("    (paper: Car 11.94  Pedestrian 9.05  Bus 11.23  Truck 8.09  Construction_vehicle 9.40)")
+    LLM_TABLE7 = ["car", "pedestrian", "bus", "truck", "construction_vehicle"]
+    da_class = iou_by_tmpl_class.get("det_area", {})
+    means = []
+    for cls in LLM_TABLE7:
+        ious_c = da_class.get(cls, [])
+        if ious_c:
+            m = float(np.mean(ious_c)) * 100
+            means.append(m)
+            print(f"  {cls:>22s}: mean={m:5.2f}  n={len(ious_c)}")
+        else:
+            print(f"  {cls:>22s}: (no det_area samples)")
+    if means:
+        print(f"  {'mean(5-class)':>22s}: {float(np.mean(means)):5.2f}")
 
     if args.out_jsonl:
         Path(args.out_jsonl).parent.mkdir(parents=True, exist_ok=True)

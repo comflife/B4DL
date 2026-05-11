@@ -41,8 +41,8 @@ from qwen_mm import (  # noqa: E402
     BOX_START,
     Collator,
     IMAGE_PLACEHOLDER,
+    LiDARMMDataset,
     MMQwen,
-    SMAPDataset,
     quantizer as q3d,
 )
 
@@ -50,17 +50,19 @@ from qwen_mm import (  # noqa: E402
 # ---------------------------------------------------------------------------
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(default="Qwen/Qwen3-0.6B")
-    mm_input_dim: int = field(default=512)
+    model_name_or_path: str = field(default="Qwen/Qwen3.5-9B")
+    mm_input_dim: int = field(default=128)
     mm_pos_dim: int = field(
-        default=0,
+        default=3,
         metadata={
-            "help": "If >0, build a positional projector that adds "
-            "Linear(mm_pos_dim, hidden) of each token's xyz to the feature "
-            "embedding. Set to 3 for VoxelNeXt-style (feat, xyz) blobs; "
-            "leave 0 for SMAP-style 12-view features."
+            "help": "Positional projector dim for VoxelNeXt token (x,y,z). "
+            "3 is the only sane value; left configurable for ablations."
         },
     )
+    voxelnext_root: str = field(default=None)
+    voxelnext_ckpt: str = field(default=None)
+    voxelnext_top_k: int = field(default=256)
+    voxelnext_freeze: bool = field(default=True)
     pretrain_mm_projector: Optional[str] = field(
         default=None,
         metadata={"help": "Path to a stage-1a mm_projector.bin to load before training."},
@@ -81,7 +83,9 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None)
-    feat_folder: str = field(default=None)
+    nuscenes_root: str = field(default=None)
+    nuscenes_version: str = field(default="v1.0-trainval")
+    n_sweeps: int = field(default=10)
     max_length: int = field(default=2048)
 
 
@@ -252,6 +256,22 @@ def main():
     if model_args.pretrain_mm_projector:
         load_mm_projector(model, model_args.pretrain_mm_projector)
 
+    # Joint VoxelNeXt encoder. Loaded after the LLM so it lives on the same
+    # CUDA device. Frozen by default; gradient never flows through it.
+    if model_args.voxelnext_root and model_args.voxelnext_ckpt:
+        if training_args.local_rank in (-1, 0):
+            print(
+                f"[sft] init VoxelNeXt: root={model_args.voxelnext_root} "
+                f"ckpt={model_args.voxelnext_ckpt} top_k={model_args.voxelnext_top_k} "
+                f"freeze={model_args.voxelnext_freeze}"
+            )
+        model.init_voxelnext(
+            voxelnext_root=model_args.voxelnext_root,
+            ckpt_path=model_args.voxelnext_ckpt,
+            top_k=model_args.voxelnext_top_k,
+            freeze=model_args.voxelnext_freeze,
+        )
+
     if model_args.tune_mm_only:
         freeze_llm_except_projector(model, n_added)
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -261,10 +281,12 @@ def main():
                   f"({100*n_trainable/n_total:.4f}%)")
 
     # Dataset
-    train_ds = SMAPDataset(
+    train_ds = LiDARMMDataset(
         data_path=data_args.data_path,
         tokenizer=tokenizer,
-        feat_folder=data_args.feat_folder,
+        nuscenes_root=data_args.nuscenes_root,
+        nuscenes_version=data_args.nuscenes_version,
+        n_sweeps=data_args.n_sweeps,
         max_length=data_args.max_length,
     )
     collator = Collator(pad_token_id=tokenizer.pad_token_id)
