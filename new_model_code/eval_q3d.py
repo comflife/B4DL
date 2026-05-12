@@ -27,7 +27,12 @@ sys.path.insert(0, str(NEW_CODE_DIR))
 
 from qwen_mm import MMQwen, IMAGE_PLACEHOLDER  # noqa: E402
 from qwen_mm.data import load_keyframe_with_sweeps  # noqa: E402
-from qwen_mm.quantizer import parse_quantized_boxes  # noqa: E402
+# quantizer chosen by --quantization_mode
+QUANT_MODE = os.environ.get("QUANT_MODE", "q3d")
+if QUANT_MODE == "999":
+    from qwen_mm.quantizer_999 import decode_text_to_boxes as parse_quantized_boxes  # noqa: E402
+else:
+    from qwen_mm.quantizer import parse_quantized_boxes  # noqa: E402
 from rewards_lidar import (  # noqa: E402
     bev_iou,
     box_center,
@@ -85,6 +90,7 @@ def parse_args():
         ),
     )
     ap.add_argument("--voxelnext_top_k", type=int, default=256)
+    ap.add_argument("--quantization_mode", default="q3d", choices=["q3d", "999"])
     ap.add_argument("--max_samples", type=int, default=200)
     ap.add_argument("--max_new_tokens", type=int, default=80)
     ap.add_argument("--out_jsonl", default=None,
@@ -188,6 +194,12 @@ def per_pair_metrics(preds, gts):
 
 def main():
     args = parse_args()
+    if args.quantization_mode == "999":
+        os.environ["QUANT_MODE"] = "999"
+        # re-import so downstream modules pick it up
+        import importlib, qwen_mm
+        if hasattr(qwen_mm, "quantizer_999"):
+            importlib.reload(qwen_mm.quantizer_999)
     print(f"[eval] sft_dir = {args.sft_dir}")
     print(f"[eval] data    = {args.data_path}")
     print(f"[eval] nuscenes_root = {args.nuscenes_root}")

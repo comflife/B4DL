@@ -71,13 +71,6 @@ class ModelArguments:
         default=False,
         metadata={"help": "If true, freeze the LLM and only train the projector + new token rows."},
     )
-    coord_aux_weight: float = field(
-        default=0.5,
-        metadata={
-            "help": "Weight for the per-axis L1 expected-coord auxiliary loss "
-            "computed on Q3D coord tokens. Set 0 to disable."
-        },
-    )
 
 
 @dataclass
@@ -91,16 +84,12 @@ class DataArguments:
 
 # ---------------------------------------------------------------------------
 def add_special_tokens_and_resize(tokenizer, model: MMQwen):
-    """Register <image>, <|box_start|>, <|box_end|>, and the 1024 Q3D coord
-    tokens (<coord_0> .. <coord_1023>) as additional special tokens. Expand
-    the embedding table once for everything that's actually new and remember
-    the relevant ids on the model.
-
-    The coord tokens are added in numeric order so they're guaranteed to be
-    contiguous in the vocabulary — that contiguity is what lets MMQwen slice
-    the coord logits with a single (min, max) range.
+    """Register <image>, <|box_start|>, <|box_end|>, and <0>..<999> as
+    additional special tokens.  The 1,000 coordinate tokens replace the
+    old 1,024 <coord_*> tokens — we drop the latter completely.
     """
-    coord_names = q3d.coord_token_names()
+    # 1,000 coordinate tokens: <0> .. <999>
+    coord_names = [f"<{i}>" for i in range(1000)]
     extras = [IMAGE_PLACEHOLDER, BOX_START, BOX_END] + coord_names
     needed = [t for t in extras if t not in tokenizer.get_vocab()]
     added = 0
@@ -108,7 +97,6 @@ def add_special_tokens_and_resize(tokenizer, model: MMQwen):
         added = tokenizer.add_special_tokens({"additional_special_tokens": needed})
     if added:
         model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-        # Init new rows to the average embedding (helps stability).
         with torch.no_grad():
             in_emb = model.get_input_embeddings().weight
             out_emb = model.get_output_embeddings().weight
@@ -119,23 +107,7 @@ def add_special_tokens_and_resize(tokenizer, model: MMQwen):
 
     image_id = tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER)
     model.set_image_token_id(image_id)
-
-    # Register the contiguous coord-token range + box markers on the model so
-    # forward() can compute the aux loss without re-running the tokenizer.
-    coord_ids = tokenizer.convert_tokens_to_ids(coord_names)
-    coord_ids_sorted = sorted(coord_ids)
-    if coord_ids_sorted != list(range(coord_ids_sorted[0], coord_ids_sorted[0] + len(coord_ids))):
-        raise RuntimeError(
-            "Q3D coord tokens did not get contiguous ids — refuse to continue. "
-            f"first ids: {coord_ids[:8]} ..."
-        )
-    model.set_coord_vocab(
-        coord_token_min=coord_ids_sorted[0],
-        coord_token_max=coord_ids_sorted[-1],
-        bin_value_table=q3d.bin_value_table(),
-        box_start_id=tokenizer.convert_tokens_to_ids(BOX_START),
-        box_end_id=tokenizer.convert_tokens_to_ids(BOX_END),
-    )
+    # No coord aux loss range needed — we use standard CE on the numeric tokens.
     return added
 
 
@@ -250,12 +222,10 @@ def main():
         model.pos_projector = None
 
     n_added = add_special_tokens_and_resize(tokenizer, model)
-    model.coord_aux_weight = float(model_args.coord_aux_weight)
     if training_args.local_rank in (-1, 0):
         print(
             f"[sft] added {n_added} special tokens; image_id={model.image_token_id} "
-            f"coord_range=[{model.coord_token_min}, {model.coord_token_max}] "
-            f"coord_aux_weight={model.coord_aux_weight}"
+            f"coord_tokens=<0>..<999>"
         )
 
     if model_args.pretrain_mm_projector:

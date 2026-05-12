@@ -80,29 +80,36 @@ def _strip_box_tokens(text: str) -> str:
 
 
 def parse_boxes(text: str) -> List[np.ndarray]:
-    """Extract every box from `text`, decoding both legacy bracketed
-    `[xmin,xmax,...,yaw]` form and Q3D `<|box_start|><coord_*>x8<|box_end|>`
-    form. Result is always a list of np.float32 arrays in
-    `[xmin, xmax, ymin, ymax, zmin, zmax, yaw]` layout, ready for the
-    geometry helpers below."""
+    """Extract every box from `text`, decoding:
+      - new 999-bin form: <|box_start|><0>..<999>x7<|box_end|>
+      - legacy bracketed [xmin,xmax,...,yaw]
+      - old Q3D <coord_*> form (backward compat)
+    """
     if not text:
         return []
     boxes: List[np.ndarray] = []
 
-    # Q3D form first (so we don't strip its <|box_start|> markers below and
-    # then re-discover the inner coord tokens — _strip_box_tokens would
-    # otherwise mangle multi-box runs).
+    # 1) New 999-bin form
     try:
-        from qwen_mm.quantizer import parse_quantized_boxes  # local import: optional dep
+        from qwen_mm.quantizer_999 import parse_999_boxes
+        for box7 in parse_999_boxes(text):
+            v = np.asarray(box7, dtype=np.float32)
+            if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
+                boxes.append(v)
+    except Exception:
+        pass
+
+    # 2) Old Q3D form (backward compat)
+    try:
+        from qwen_mm.quantizer import parse_quantized_boxes
         for box7 in parse_quantized_boxes(text):
             v = np.asarray(box7, dtype=np.float32)
             if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
                 boxes.append(v)
     except Exception:
-        # Quantizer unavailable or parse failed — silently fall back to text.
         pass
 
-    # Legacy text form (still supported for old eval logs / mixed outputs).
+    # 3) Legacy text form
     legacy_text = _strip_box_tokens(text)
     for m in _BBOX_RE.finditer(legacy_text):
         try:
