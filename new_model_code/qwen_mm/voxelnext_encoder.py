@@ -133,8 +133,22 @@ class VoxelNeXtEncoder(nn.Module):
             for p in self.model.parameters():
                 p.requires_grad_(False)
 
+        # spconv / pcdet internals are not safe under bf16; keep the encoder
+        # in fp32 regardless of what dtype the parent MMQwen lives in.
+        self.model = self.model.to(torch.float32)
+
         # Voxel generator is built lazily on first forward (needs cuda dev).
         self._voxel_gen = None
+
+    # ------------------------------------------------------------------
+    def to(self, *args, **kwargs):
+        """Keep the pcdet sub-model permanently in fp32 (spconv is not bf16-safe)."""
+        # Run the normal Module.to() first so buffers / params we own move.
+        super().to(*args, **kwargs)
+        # Force the pcdet model back to fp32 regardless of parent dtype.
+        if hasattr(self, "model") and self.model is not None:
+            self.model = self.model.to(torch.float32)
+        return self
 
     # ------------------------------------------------------------------
     def _current_device(self) -> torch.device:

@@ -220,12 +220,15 @@ def main():
         attn_implementation="sdpa",
     )
     model.mm_input_dim = model_args.mm_input_dim
-    # If we loaded a checkpoint trained with an existing projector, the linear
-    # already exists with the right shape. Otherwise rebuild here.
-    if model.mm_projector.in_features != model_args.mm_input_dim:
-        model.mm_projector = nn.Linear(
-            model_args.mm_input_dim, model.config.hidden_size
-        ).to(dtype)
+    # NOTE: keep projectors in fp32 — tiny module, bf16 grad underflow is
+    # a common source of nan when only the projector trains (stage 1a).
+    # Also work around a transformers 5.8.0 bug: when from_pretrained is called
+    # with torch_dtype=torch.bfloat16, parameters that are NOT present in the
+    # checkpoint (like our custom mm_projector) get corrupted with NaN/garbage
+    # values. We always rebuild the projector here so it has clean init.
+    model.mm_projector = nn.Linear(
+        model_args.mm_input_dim, model.config.hidden_size
+    ).to(torch.float32)
     model.config.mm_input_dim = model_args.mm_input_dim
 
     # Positional projector (VoxelNeXt path). Build if requested even when
@@ -240,7 +243,9 @@ def main():
         if need_new:
             model.pos_projector = nn.Linear(
                 model.mm_pos_dim, model.config.hidden_size
-            ).to(dtype)
+            ).to(torch.float32)
+        elif model.pos_projector is not None:
+            model.pos_projector = model.pos_projector.to(torch.float32)
     else:
         model.pos_projector = None
 
@@ -291,7 +296,69 @@ def main():
     )
     collator = Collator(pad_token_id=tokenizer.pad_token_id)
 
-    trainer = Trainer(
+    class _DebugTrainer(Trainer):
+        """Temporary wrapper to surface why loss becomes 0 / grad_norm nan."""
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            # ---- nan hunt: VoxelNeXt output ---------------------------------
+            points = inputs.get("points")
+            if points is not None and hasattr(model, "voxelnext") and model.voxelnext is not None:
+                with torch.no_grad():
+                    try:
+                        blobs = model.voxelnext(points)
+                        for idx, b in enumerate(blobs):
+                            if b is not None:
+                                feat_nan = torch.isnan(b["feat"]).any().item()
+                                xyz_nan = torch.isnan(b["xyz"]).any().item()
+                                feat_inf = torch.isinf(b["feat"]).any().item()
+                                if feat_nan or xyz_nan or feat_inf:
+                                    print(
+                                        f"[NAN ALERT] VoxelNeXt blob[{idx}] "
+                                        f"feat_nan={feat_nan} xyz_nan={xyz_nan} feat_inf={feat_inf}"
+                                    )
+                        p = next(model.voxelnext.model.parameters(), None)
+                        if p is not None:
+                            print(f"[DEBUG] voxelnext.model dtype={p.dtype} device={p.device}")
+                    except Exception as e:
+                        print(f"[DEBUG] voxelnext check failed: {e}")
+
+            # ---- forward ----------------------------------------------------
+            outputs = model(**inputs)
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                logits = outputs.logits if hasattr(outputs, "logits") else None
+                if logits is not None:
+                    print(
+                        f"[NAN ALERT] loss=nan. logits nan={torch.isnan(logits).any().item()} "
+                        f"inf={torch.isinf(logits).any().item()} "
+                        f"min={logits.min().item():.4f} max={logits.max().item():.4f}"
+                    )
+                # check first hidden state if available
+                if hasattr(outputs, "hidden_states") and outputs.hidden_states:
+                    hs = outputs.hidden_states[0]
+                    print(
+                        f"[NAN ALERT] hidden[0] nan={torch.isnan(hs).any().item()} "
+                        f"inf={torch.isinf(hs).any().item()}"
+                    )
+
+            # DEBUG: uncomment below if you need per-step diagnostics again
+            # if self.state.global_step < 10:
+            #     lbl = inputs.get("labels")
+            #     n_valid = (lbl != -100).sum().item() if lbl is not None else -1
+            #     loss_val = (
+            #         loss.item()
+            #         if not (torch.isnan(loss).any() or torch.isinf(loss).any())
+            #         else float("nan")
+            #     )
+            #     print(
+            #         f"[MMTrainer step {self.state.global_step}] loss={loss_val:.6f} "
+            #         f"valid_labels={n_valid}/{lbl.numel() if lbl is not None else 0} "
+            #         f"input_ids={inputs['input_ids'].shape}"
+            #     )
+            return (loss, outputs) if return_outputs else loss
+
+    trainer = _DebugTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
