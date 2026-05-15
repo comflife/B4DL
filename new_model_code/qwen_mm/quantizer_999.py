@@ -1,8 +1,7 @@
-"""Simple 0-999 linear quantizer for 3D bbox coordinates.
+"""0-999 token quantizer for 3D bbox coordinates.
 
-Replaces the complex Q3D codebook with uniform 1000-bin quantization per axis.
-All coordinates are quantized to integers in [0, 999] and represented as
-special tokens <0>, <1>, ..., <999>.
+Continuous box values are quantized to integers in [0, 999] and represented
+as special tokens <0>, <1>, ..., <999>.
 
 Box format:
     <|box_start|><cx><cy><cz><w><l><h><yaw><|box_end|>
@@ -13,7 +12,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import List, Sequence, Tuple
+from typing import List, Sequence
 
 # Axis ranges (metres / radians)
 _RANGES = {
@@ -94,12 +93,13 @@ def encode_box_to_text(box7: Sequence[float]) -> str:
     return f"{BOX_START}{body}{BOX_END}"
 
 
-# Regex to find <0> ... <999> tokens between box markers
+# Regex to find exactly seven <0> ... <999> tokens between box markers.
 _QBOX_RE = re.compile(
     re.escape(BOX_START)
-    + r"" + r"(<(\d{1,3})>)" * 7
+    + r"((?:<\d{1,3}>){7})"
     + re.escape(BOX_END)
 )
+_TOKEN_RE = re.compile(r"<(\d{1,3})>")
 
 
 def parse_999_boxes(text: str) -> List[List[float]]:
@@ -107,8 +107,25 @@ def parse_999_boxes(text: str) -> List[List[float]]:
     out = []
     for m in _QBOX_RE.finditer(text):
         try:
-            idxs = [int(m.group(i + 1)) for i in range(7)]
+            idxs = [int(x) for x in _TOKEN_RE.findall(m.group(1))]
+            if len(idxs) != 7 or any(i < 0 or i >= N_BINS for i in idxs):
+                continue
             out.append(decode_box(idxs))
         except Exception:
             continue
     return out
+
+
+decode_text_to_boxes = parse_999_boxes
+
+
+__all__ = [
+    "N_BINS",
+    "BOX_START",
+    "BOX_END",
+    "encode_box",
+    "decode_box",
+    "encode_box_to_text",
+    "parse_999_boxes",
+    "decode_text_to_boxes",
+]

@@ -69,27 +69,6 @@ class MMQwen(Qwen3_5ForCausalLM):
             persistent=False,
         )
 
-        # Q3D coord-vocab metadata. `set_coord_vocab` populates these after
-        # tokenizer surgery; defaults keep checkpoint loading cheap.
-        self.coord_token_min: Optional[int] = getattr(config, "coord_token_min", None)
-        self.coord_token_max: Optional[int] = getattr(config, "coord_token_max", None)
-        self.box_start_id: Optional[int] = getattr(config, "box_start_id", None)
-        self.box_end_id: Optional[int] = getattr(config, "box_end_id", None)
-        # Weight of the per-axis L1 expected-coord auxiliary loss. The trainer
-        # overwrites this from --coord_aux_weight at startup.
-        self.coord_aux_weight: float = float(getattr(config, "coord_aux_weight", 0.0))
-        # The bin_value table is static (8, 1024) — registered as a buffer so
-        # it follows .to(device)/.to(dtype) transparently. We initialise from
-        # the quantizer here so a model loaded via from_pretrained() already
-        # has the table populated; the trainer can still override via
-        # `set_coord_vocab` if a future iteration changes the codebook layout.
-        try:
-            from .quantizer import bin_value_table as _bvt
-            init = torch.as_tensor(_bvt(), dtype=torch.float32)
-        except Exception:
-            init = torch.zeros(8, 1024)
-        self.register_buffer("bin_value_table", init, persistent=False)
-
         # Joint VoxelNeXt encoder is attached lazily by `init_voxelnext`.
         self.voxelnext = None
 
@@ -130,134 +109,8 @@ class MMQwen(Qwen3_5ForCausalLM):
         self.config.image_token_id = int(tid)
         self.config.mm_input_dim = self.mm_input_dim
 
-    def set_coord_vocab(
-        self,
-        coord_token_min: int,
-        coord_token_max: int,
-        bin_value_table,
-        box_start_id: int,
-        box_end_id: int,
-    ):
-        """Wire the contiguous Q3D coord-token range, the (8, 1024) bin-value
-        table, and the box-marker ids onto the model. The trainer calls this
-        once after tokenizer surgery."""
-        self.coord_token_min = int(coord_token_min)
-        self.coord_token_max = int(coord_token_max)
-        self.box_start_id = int(box_start_id)
-        self.box_end_id = int(box_end_id)
-        # bin_value_table: numpy or torch, shape (8, 1024). We keep it as a
-        # buffer in fp32; the aux-loss path casts to logits' dtype.
-        if not isinstance(bin_value_table, torch.Tensor):
-            bin_value_table = torch.as_tensor(bin_value_table, dtype=torch.float32)
-        if bin_value_table.shape != (8, 1024):
-            raise ValueError(f"bin_value_table must be (8, 1024); got {tuple(bin_value_table.shape)}")
-        self.bin_value_table = bin_value_table.to(dtype=torch.float32)
-        # Persist range/box ids on config so save/load round-trips them.
-        self.config.coord_token_min = self.coord_token_min
-        self.config.coord_token_max = self.coord_token_max
-        self.config.box_start_id = self.box_start_id
-        self.config.box_end_id = self.box_end_id
-
     def get_mm_projector(self) -> nn.Module:
         return self.mm_projector
-
-    # ------------------------------------------------------------------
-    # Q3D auxiliary loss: CE on coord tokens is already covered by the
-    # standard LM loss; here we add a *differentiable expected-coord* L1
-    # term that gives the model direct distance gradient instead of the
-    # all-or-nothing token-level CE.
-    # ------------------------------------------------------------------
-    def _build_axis_ids(self, labels: torch.Tensor) -> Optional[torch.Tensor]:
-        """Per-position axis id (0..7) for tokens that belong to a Q3D box;
-        -1 elsewhere. Same shape as `labels`. Returns None if no box markers
-        are present, so the caller can short-circuit cheaply.
-
-        We rely on the dataset emitting the canonical 8-token layout
-        `<|box_start|><X><Y><Z><W><L><H><SIN><COS><|box_end|>`. For each
-        `<|box_start|>` position we walk forward up to 8 coord tokens, tag
-        them with axis 0..7, and stop at the first non-coord (which should
-        be `<|box_end|>`). Anything else is left at -1.
-
-        This is O(B * #boxes_per_sample) — for det_area that's ~5 per sample
-        and the loop overhead is negligible relative to forward pass.
-        """
-        if self.box_start_id is None or self.coord_token_min is None:
-            return None
-        starts = (labels == self.box_start_id).nonzero(as_tuple=False)
-        if starts.numel() == 0:
-            return None
-
-        axis_ids = torch.full_like(labels, -1)
-        T = labels.shape[1]
-        cmin = self.coord_token_min
-        cmax = self.coord_token_max
-        # Operate on CPU lists for control flow — much simpler than vector
-        # gather and the count is tiny.
-        starts_cpu = starts.tolist()
-        labels_cpu = labels.tolist()
-        for b, s in starts_cpu:
-            row = labels_cpu[b]
-            for k in range(8):
-                pos = s + 1 + k
-                if pos >= T:
-                    break
-                tok = row[pos]
-                if cmin <= tok <= cmax:
-                    axis_ids[b, pos] = k
-                else:
-                    break
-        return axis_ids
-
-    def _coord_aux_loss(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """L1 loss between the per-axis *expected* coord (softmax-weighted
-        sum of bin values) and the GT bin's value. Differentiable with
-        respect to the coord-vocab logits, complementing standard CE."""
-        axis_ids = self._build_axis_ids(labels)
-        if axis_ids is None:
-            return None
-
-        # Standard causal-LM shift: logits[:, :-1] predict labels[:, 1:].
-        shift_logits = logits[:, :-1, :]
-        shift_labels = labels[:, 1:]
-        shift_axis = axis_ids[:, 1:]
-
-        coord_mask = shift_axis >= 0
-        if not coord_mask.any():
-            return None
-
-        valid_logits = shift_logits[coord_mask]               # (N, V)
-        valid_labels = shift_labels[coord_mask]               # (N,)
-        valid_axis = shift_axis[coord_mask]                   # (N,)
-
-        # Slice to the contiguous coord-vocab range.
-        cmin = self.coord_token_min
-        cmax = self.coord_token_max
-        coord_logits = valid_logits[:, cmin : cmax + 1]       # (N, 1024)
-        # Float32 for stable softmax even when logits are bf16.
-        probs = torch.softmax(coord_logits.float(), dim=-1)   # (N, 1024)
-
-        bins = self.bin_value_table.to(probs.device).float()   # (8, 1024)
-        bv = bins[valid_axis]                                  # (N, 1024)
-        expected = (probs * bv).sum(dim=-1)                    # (N,)
-        target = bins[valid_axis, valid_labels - cmin]         # (N,)
-
-        # Per-axis weighting: xy/z get unit weight; sizes (log-space) and
-        # sin/cos (unit interval) are inherently smaller-scale, so we scale
-        # them up so they contribute on the same order as the centre L1.
-        # (Sizes range up to ~20m, sin/cos in [-1, 1] — without scaling, the
-        # centre L1 would dominate even though all axes matter for IoU.)
-        per_axis_scale = torch.tensor(
-            [1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 1.0, 1.0],
-            dtype=probs.dtype,
-            device=probs.device,
-        )
-        scale = per_axis_scale[valid_axis]
-        l1 = (torch.abs(expected - target) * scale).mean()
-        return l1
 
     # ------------------------------------------------------------------
     # Splicing helper.
@@ -439,17 +292,6 @@ class MMQwen(Qwen3_5ForCausalLM):
             **kwargs,
         )
 
-        # Per-axis L1 aux loss on Q3D coord positions. Skipped during
-        # generation (labels=None) and when the weight is 0.
-        if (
-            labels is not None
-            and self.coord_aux_weight > 0.0
-            and self.coord_token_min is not None
-            and out.loss is not None
-        ):
-            aux = self._coord_aux_loss(out.logits, labels)
-            if aux is not None:
-                out.loss = out.loss + self.coord_aux_weight * aux
         return out
 
     @torch.no_grad()

@@ -28,7 +28,7 @@ fi
 
 # -------- Stage 1b --------
 if [ ! -f "$STAGE1B_DIR/model.safetensors" ] && [ ! -f "$STAGE1B_DIR/pytorch_model.bin" ]; then
-    echo "--- Stage 1b: full SFT ---"
+    echo "--- Stage 1b: full SFT, frozen VoxelNeXt ---"
     bash "$SCRIPT_DIR/stage1b.sh"
 else
     echo "--- Stage 1b: checkpoint found at $STAGE1B_DIR, skip ---"
@@ -40,7 +40,7 @@ QUANT_MODE=999 GPUS=0 bash "$SCRIPT_DIR/eval.sh" "$STAGE1B_DIR" "$STAGE1B_DIR/ev
 
 # -------- Stage 1c --------
 if [ ! -f "$STAGE1C_DIR/model.safetensors" ] && [ ! -f "$STAGE1C_DIR/pytorch_model.bin" ]; then
-    echo "--- Stage 1c: det_area-only SFT ---"
+    echo "--- Stage 1c: det_area-only SFT, frozen VoxelNeXt ---"
     bash "$SCRIPT_DIR/stage1c.sh"
 else
     echo "--- Stage 1c: checkpoint found at $STAGE1C_DIR, skip ---"

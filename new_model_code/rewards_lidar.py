@@ -1,13 +1,10 @@
 """LiDAR-aware GRPO rewards for nuGrounding outputs.
 
-Output format the dataset uses (this is *not* center-form 7-DOF; it is the
-axis-aligned-min-max plus yaw):
+The dataset stores boxes as axis-aligned min/max plus yaw:
     [xmin, xmax, ymin, ymax, zmin, zmax, yaw]
-either as a single bracketed list, wrapped in [[...]] / <|box_start|>...<|box_end|>
-when there are multiple boxes, or — under the Q3D pipeline — as eight
-`<coord_*>` tokens between `<|box_start|>` and `<|box_end|>`. We accept both
-formats so this module can score legacy SFT outputs and quantised ones with
-the same call signature.
+Training targets use the 0-999 token form:
+    <|box_start|><cx><cy><cz><w><l><h><yaw><|box_end|>
+Bracketed boxes are still accepted for raw debugging outputs.
 
 We made two design choices that diverge from the user's brief because of this
 data layout:
@@ -40,6 +37,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -71,6 +69,22 @@ NUSC_CLASSES = (
 )
 
 
+def _parse_999_boxes(text: str) -> List[List[float]]:
+    try:
+        from qwen_mm.quantizer_999 import parse_999_boxes
+        return parse_999_boxes(text)
+    except Exception:
+        import importlib.util
+
+        path = Path(__file__).resolve().parent / "qwen_mm" / "quantizer_999.py"
+        spec = importlib.util.spec_from_file_location("quantizer_999", path)
+        if spec is None or spec.loader is None:
+            return []
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.parse_999_boxes(text)
+
+
 def _strip_box_tokens(text: str) -> str:
     """Remove <|box_start|> / <|box_end|> markers but keep the bbox content
     so the regex below can still find the 7-tuple."""
@@ -81,35 +95,18 @@ def _strip_box_tokens(text: str) -> str:
 
 def parse_boxes(text: str) -> List[np.ndarray]:
     """Extract every box from `text`, decoding:
-      - new 999-bin form: <|box_start|><0>..<999>x7<|box_end|>
-      - legacy bracketed [xmin,xmax,...,yaw]
-      - old Q3D <coord_*> form (backward compat)
+      - 999-bin form: <|box_start|><0>..<999>x7<|box_end|>
+      - bracketed [xmin,xmax,...,yaw]
     """
     if not text:
         return []
     boxes: List[np.ndarray] = []
 
-    # 1) New 999-bin form
-    try:
-        from qwen_mm.quantizer_999 import parse_999_boxes
-        for box7 in parse_999_boxes(text):
-            v = np.asarray(box7, dtype=np.float32)
-            if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
-                boxes.append(v)
-    except Exception:
-        pass
+    for box7 in _parse_999_boxes(text):
+        v = np.asarray(box7, dtype=np.float32)
+        if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
+            boxes.append(v)
 
-    # 2) Old Q3D form (backward compat)
-    try:
-        from qwen_mm.quantizer import parse_quantized_boxes
-        for box7 in parse_quantized_boxes(text):
-            v = np.asarray(box7, dtype=np.float32)
-            if v[0] <= v[1] and v[2] <= v[3] and v[4] <= v[5]:
-                boxes.append(v)
-    except Exception:
-        pass
-
-    # 3) Legacy text form
     legacy_text = _strip_box_tokens(text)
     for m in _BBOX_RE.finditer(legacy_text):
         try:

@@ -463,7 +463,7 @@ def parse_args():
     ap.add_argument("--voxelnext_top_k", type=int, default=256)
     ap.add_argument(
         "--data_path",
-        default=f"{_data_root}/data/3dtesting_train_q3d.json",
+        default=f"{_data_root}/data/3dtesting_train_999.json",
     )
     ap.add_argument(
         "--output_dir",

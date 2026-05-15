@@ -1,12 +1,12 @@
-"""Quick-look evaluator for a Q3D-trained Qwen3.5 + joint VoxelNeXt checkpoint.
+"""Evaluator for a 999-bin Qwen3.5 + joint VoxelNeXt checkpoint.
 
 Loads the SFT model, attaches the frozen VoxelNeXt encoder, runs greedy
-generation on a held-out slice of the quantised val set, and reports
+generation on a held-out slice of the quantized val set, and reports
 parse rate, BEV-IoU, centre L2, heading, class-match (for det_object),
 and per-template breakdowns.
 
-Intended as a smoke check between stage 1b and GRPO — *not* a full
-benchmark. Use --max_samples to keep runtime sane on a single GPU.
+By default this is a smoke check between stage 1b and GRPO. Use
+--max_samples 0 for a full validation pass.
 """
 from __future__ import annotations
 
@@ -27,14 +27,8 @@ sys.path.insert(0, str(NEW_CODE_DIR))
 
 from qwen_mm import MMQwen, IMAGE_PLACEHOLDER  # noqa: E402
 from qwen_mm.data import load_keyframe_with_sweeps  # noqa: E402
-# quantizer chosen by --quantization_mode
-QUANT_MODE = os.environ.get("QUANT_MODE", "q3d")
-if QUANT_MODE == "999":
-    from qwen_mm.quantizer_999 import decode_text_to_boxes as parse_quantized_boxes  # noqa: E402
-else:
-    from qwen_mm.quantizer import parse_quantized_boxes  # noqa: E402
 from rewards_lidar import (  # noqa: E402
-    bev_iou,
+    bev_iou as axis_aligned_bev_iou,
     box_center,
     parse_boxes,
     parse_class,
@@ -64,12 +58,17 @@ SUPER5 = {
 def parse_args():
     _data_root = os.environ.get("DATA_ROOT", "/data1/byounggun/3davs_b4dl")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sft_dir", required=True,
-                    help="Stage-1b checkpoint dir (output_dir from stage1b_full.sh)")
+    ap.add_argument(
+        "--sft_dir",
+        "--model_path",
+        dest="sft_dir",
+        required=True,
+        help="Stage checkpoint dir with model + tokenizer.",
+    )
     ap.add_argument("--lora_adapter", default=None,
                     help="Optional GRPO LoRA adapter dir (e.g., qwen_stage2_grpo_vxnxt/step_100). "
                     "Loaded on top of the SFT base via peft.")
-    ap.add_argument("--data_path", default=f"{_data_root}/data/3dtesting_val_q3d.json")
+    ap.add_argument("--data_path", default=f"{_data_root}/data/3dtesting_val_999.json")
     ap.add_argument(
         "--nuscenes_root",
         default=os.environ.get("NUSCENES_ROOT", f"{_data_root}/nuscenes"),
@@ -90,9 +89,23 @@ def parse_args():
         ),
     )
     ap.add_argument("--voxelnext_top_k", type=int, default=256)
-    ap.add_argument("--quantization_mode", default="q3d", choices=["q3d", "999"])
-    ap.add_argument("--max_samples", type=int, default=200)
+    ap.add_argument(
+        "--max_samples",
+        type=int,
+        default=200,
+        help="Number of validation samples to evaluate. Use 0 or negative for all samples.",
+    )
     ap.add_argument("--max_new_tokens", type=int, default=80)
+    ap.add_argument(
+        "--bev_iou_mode",
+        choices=("rotated", "axis_aligned"),
+        default="rotated",
+        help="BEV IoU for reporting. 'rotated' uses decoded center/size/yaw; "
+        "'axis_aligned' matches the GRPO reward implementation.",
+    )
+    ap.add_argument("--output_dir", default=None)
+    ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--out_jsonl", default=None,
                     help="Optional path to dump per-sample (prompt, gt, pred) records.")
     return ap.parse_args()
@@ -162,7 +175,91 @@ def safe_load_points(nusc, scene_id: str, n_sweeps: int = 10):
     return torch.from_numpy(pts_np)
 
 
-def per_pair_metrics(preds, gts):
+def _cross(a: np.ndarray, b: np.ndarray) -> float:
+    return float(a[0] * b[1] - a[1] * b[0])
+
+
+def _poly_area(poly) -> float:
+    if len(poly) < 3:
+        return 0.0
+    pts = np.asarray(poly, dtype=np.float64)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) * 0.5)
+
+
+def _rotated_bev_corners(box: np.ndarray):
+    cx = float((box[0] + box[1]) * 0.5)
+    cy = float((box[2] + box[3]) * 0.5)
+    w = max(0.0, float(box[1] - box[0]))
+    l = max(0.0, float(box[3] - box[2]))
+    yaw = float(box[6])
+    c, s = math.cos(yaw), math.sin(yaw)
+    local = [(-w * 0.5, -l * 0.5), (w * 0.5, -l * 0.5),
+             (w * 0.5, l * 0.5), (-w * 0.5, l * 0.5)]
+    return [
+        np.array([cx + x * c - y * s, cy + x * s + y * c], dtype=np.float64)
+        for x, y in local
+    ]
+
+
+def _line_intersection(p1, p2, q1, q2):
+    r = p2 - p1
+    s = q2 - q1
+    denom = _cross(r, s)
+    if abs(denom) < 1e-9:
+        return p2
+    t = _cross(q1 - p1, s) / denom
+    return p1 + t * r
+
+
+def _clip_polygon(subject, clipper):
+    """Sutherland-Hodgman clipping for two CCW convex polygons."""
+    out = list(subject)
+    for i in range(len(clipper)):
+        cp1 = clipper[i]
+        cp2 = clipper[(i + 1) % len(clipper)]
+        inp = out
+        out = []
+        if not inp:
+            break
+
+        def inside(p):
+            return _cross(cp2 - cp1, p - cp1) >= -1e-9
+
+        s = inp[-1]
+        for e in inp:
+            if inside(e):
+                if not inside(s):
+                    out.append(_line_intersection(s, e, cp1, cp2))
+                out.append(e)
+            elif inside(s):
+                out.append(_line_intersection(s, e, cp1, cp2))
+            s = e
+    return out
+
+
+def rotated_bev_iou(a: np.ndarray, b: np.ndarray) -> float:
+    area_a = max(0.0, float(a[1] - a[0])) * max(0.0, float(a[3] - a[2]))
+    area_b = max(0.0, float(b[1] - b[0])) * max(0.0, float(b[3] - b[2]))
+    if area_a <= 1e-9 or area_b <= 1e-9:
+        return 0.0
+    pa = _rotated_bev_corners(a)
+    pb = _rotated_bev_corners(b)
+    inter = _poly_area(_clip_polygon(pa, pb))
+    union = area_a + area_b - inter
+    if union <= 1e-9:
+        return 0.0
+    return float(max(0.0, min(1.0, inter / union)))
+
+
+def compute_bev_iou(a: np.ndarray, b: np.ndarray, mode: str) -> float:
+    if mode == "axis_aligned":
+        return axis_aligned_bev_iou(a, b)
+    return rotated_bev_iou(a, b)
+
+
+def per_pair_metrics(preds, gts, bev_iou_mode: str = "rotated"):
     """Best-match centre L2 + IoU. Returns (matched_pairs, missed, extra)."""
     if not preds or not gts:
         return [], len(gts), len(preds)
@@ -171,7 +268,7 @@ def per_pair_metrics(preds, gts):
     cdist = np.zeros((P, G), dtype=np.float32)
     for i in range(P):
         for j in range(G):
-            iou[i, j] = bev_iou(preds[i], gts[j])
+            iou[i, j] = compute_bev_iou(preds[i], gts[j], bev_iou_mode)
             cdist[i, j] = float(np.linalg.norm(box_center(preds[i]) - box_center(gts[j])))
     # Greedy by IoU desc, then centre asc.
     used_p, used_g = set(), set()
@@ -194,15 +291,12 @@ def per_pair_metrics(preds, gts):
 
 def main():
     args = parse_args()
-    if args.quantization_mode == "999":
-        os.environ["QUANT_MODE"] = "999"
-        # re-import so downstream modules pick it up
-        import importlib, qwen_mm
-        if hasattr(qwen_mm, "quantizer_999"):
-            importlib.reload(qwen_mm.quantizer_999)
+    if args.output_dir and not args.out_jsonl:
+        args.out_jsonl = str(Path(args.output_dir) / "predictions.jsonl")
     print(f"[eval] sft_dir = {args.sft_dir}")
     print(f"[eval] data    = {args.data_path}")
     print(f"[eval] nuscenes_root = {args.nuscenes_root}")
+    print(f"[eval] bev_iou_mode = {args.bev_iou_mode}")
 
     model, tok = load_model(
         args.sft_dir,
@@ -216,7 +310,8 @@ def main():
         version=args.nuscenes_version, dataroot=args.nuscenes_root, verbose=False
     )
     data = json.load(open(args.data_path))
-    print(f"[eval] val n   = {len(data)} (using first {args.max_samples})")
+    eval_data = data if args.max_samples <= 0 else data[: args.max_samples]
+    print(f"[eval] val n   = {len(data)} (using {len(eval_data)})")
 
     metrics_by_tmpl = defaultdict(lambda: {
         "n": 0, "parsed": 0, "ious": [], "cdists": [],
@@ -230,10 +325,12 @@ def main():
     # Per-template-per-class so we can isolate visual-grounding-style Car
     # mIoU on det_area (real localisation) from det_object (echo).
     iou_by_tmpl_class = defaultdict(lambda: defaultdict(list))
+    table6_by_class = defaultdict(lambda: {"ok": 0, "total": 0, "super_ok": 0})
+    table7_iou_by_class = defaultdict(list)
 
     out_records = []
     skipped = 0
-    for i, sample in enumerate(data[: args.max_samples]):
+    for i, sample in enumerate(eval_data):
         scene_id = sample.get("sample_token") or sample.get("scene_id")
         points = safe_load_points(nusc, scene_id, args.n_sweeps)
         if points is None:
@@ -268,7 +365,7 @@ def main():
 
         preds = parse_boxes(pred_text)
         gts = parse_boxes(gt_text)
-        pairs, missed, extra = per_pair_metrics(preds, gts)
+        pairs, missed, extra = per_pair_metrics(preds, gts, args.bev_iou_mode)
 
         if preds:
             m["parsed"] += 1
@@ -294,6 +391,18 @@ def main():
                 iou_by_class[gc].append(iou)
                 iou_by_tmpl_class[tmpl][gc].append(iou)
 
+            if tmpl == "det_object":
+                table6_by_class[gc]["total"] += 1
+                if pc == gc:
+                    table6_by_class[gc]["ok"] += 1
+                if pc and SUPER5.get(pc) == SUPER5.get(gc):
+                    table6_by_class[gc]["super_ok"] += 1
+
+            if tmpl == "det_area" and gts:
+                matched_by_gt = {gt_idx: iou for _, gt_idx, iou, _ in pairs}
+                for gt_idx in range(len(gts)):
+                    table7_iou_by_class[gc].append(float(matched_by_gt.get(gt_idx, 0.0)))
+
         if args.out_jsonl:
             out_records.append({
                 "scene_id": scene_id,
@@ -309,7 +418,7 @@ def main():
             print(f"  ... {i+1} samples (skipped {skipped})")
 
     # ---- summary ------------------------------------------------------
-    print("\n=== Q3D eval summary ===")
+    print("\n=== 999-bin eval summary ===")
     print(f"skipped (missing feat) : {skipped}")
     for tmpl, m in metrics_by_tmpl.items():
         n = m["n"]
@@ -328,16 +437,17 @@ def main():
         print(line)
 
     # ---- LiDAR-LLM-style aggregate metrics ----------------------------
-    # Combined ACC-10 / ACC-5 across all templates that had a class word.
+    # Combined exact / ACC-5 across all templates that had a class word.
     all_class_ok = sum(m["class_ok"] for m in metrics_by_tmpl.values())
     all_class_total = sum(m["class_total"] for m in metrics_by_tmpl.values())
     all_super_ok = sum(m["class_super_ok"] for m in metrics_by_tmpl.values())
     all_super_total = sum(m["class_super_total"] for m in metrics_by_tmpl.values())
     all_ious = [iou for m in metrics_by_tmpl.values() for iou in m["ious"]]
 
-    print("\n=== LiDAR-LLM comparable metrics ===")
+    print("\n=== LiDAR-LLM-style aggregate metrics ===")
     print(
-        f"ACC-10 (exact)        : {all_class_ok/max(1, all_class_total):.2%}  "
+        f"ACC-{len(NUSC_CLASSES):02d} (exact, all templates): "
+        f"{all_class_ok/max(1, all_class_total):.2%}  "
         f"({all_class_ok}/{all_class_total})"
     )
     print(
@@ -346,7 +456,7 @@ def main():
     )
     if all_ious:
         print(
-            f"BEV mIoU (all matched): {np.mean(all_ious):.3f}  "
+            f"BEV mIoU ({args.bev_iou_mode}, all matched): {np.mean(all_ious):.3f}  "
             f"(matched={len(all_ious)})"
         )
     print("BEV mIoU per class:")
@@ -373,20 +483,51 @@ def main():
     elif "car" in iou_by_class:
         print("  det_area: no det_area Car samples in this slice")
 
+    # ---- LiDAR-LLM Table 6 ------------------------------------------------
+    # Grounded Captioning: prompt gives a bbox; answer should name the object.
+    print("\n=== LiDAR-LLM Table 6: Grounded Captioning (det_object) ===")
+    print("Protocol: bbox is given in the prompt; score is top-1 class accuracy.")
+    table6_total = sum(v["total"] for v in table6_by_class.values())
+    table6_ok = sum(v["ok"] for v in table6_by_class.values())
+    table6_super_ok = sum(v["super_ok"] for v in table6_by_class.values())
+    if len(NUSC_CLASSES) == 19:
+        print(f"ACC-19: {table6_ok/max(1, table6_total):.2%}  ({table6_ok}/{table6_total})")
+    else:
+        print(
+            "ACC-19: N/A "
+            f"(current eval label space is nuScenes {len(NUSC_CLASSES)} classes)"
+        )
+        print(
+            f"ACC-{len(NUSC_CLASSES):02d}: {table6_ok/max(1, table6_total):.2%}  "
+            f"({table6_ok}/{table6_total})"
+        )
+    print(
+        f"ACC-5 : {table6_super_ok/max(1, table6_total):.2%}  "
+        f"({table6_super_ok}/{table6_total})"
+    )
+    print("Per-class top-1 accuracy:")
+    for cls in NUSC_CLASSES:
+        stat = table6_by_class.get(cls)
+        if stat and stat["total"]:
+            print(
+                f"  {cls:>22s}: {stat['ok']/stat['total']:.2%}  "
+                f"({stat['ok']}/{stat['total']})"
+            )
+
     # ---- LiDAR-LLM Table 7 (Appendix A.2) reproduction -------------------
     # 5-category Visual-Grounding mIoU. Only det_area samples count as a
     # true VG eval — det_object echoes the input box and inflates numbers.
-    print("\n=== LiDAR-LLM Table 7 (det_area only, 5-class mIoU) ===")
+    print("\n=== LiDAR-LLM Table 7: Visual Grounding (det_area only, 5-class BEV mIoU) ===")
+    print(f"Protocol: predicted boxes are matched to GT boxes; missed GT boxes count as IoU=0. BEV IoU mode={args.bev_iou_mode}.")
     print("    (paper: Car 11.94  Pedestrian 9.05  Bus 11.23  Truck 8.09  Construction_vehicle 9.40)")
     LLM_TABLE7 = ["car", "pedestrian", "bus", "truck", "construction_vehicle"]
-    da_class = iou_by_tmpl_class.get("det_area", {})
     means = []
     for cls in LLM_TABLE7:
-        ious_c = da_class.get(cls, [])
+        ious_c = table7_iou_by_class.get(cls, [])
         if ious_c:
             m = float(np.mean(ious_c)) * 100
             means.append(m)
-            print(f"  {cls:>22s}: mean={m:5.2f}  n={len(ious_c)}")
+            print(f"  {cls:>22s}: mIoU={m:5.2f}  n_gt={len(ious_c)}")
         else:
             print(f"  {cls:>22s}: (no det_area samples)")
     if means:

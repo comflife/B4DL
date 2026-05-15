@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stage 1c — det_area-only continued SFT from stage1b.
+# Stage 1c — det_area-only continued SFT from stage1b, with frozen VoxelNeXt.
 set -e
 
 [ -f "$HOME/.bashrc.b4dl" ] && source "$HOME/.bashrc.b4dl"

@@ -8,8 +8,21 @@ if [ $# -lt 1 ]; then
 fi
 
 CKPT_DIR="$1"
-OUT_DIR="${2:-$CKPT_DIR/eval_val}"
-GPU="${3:-0}"
+shift
+
+if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    OUT_DIR="$1"
+    shift
+else
+    OUT_DIR="$CKPT_DIR/eval_val"
+fi
+
+if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    GPU="$1"
+    shift
+else
+    GPU=0
+fi
 
 [ -f "$HOME/.bashrc.b4dl" ] && source "$HOME/.bashrc.b4dl"
 source /home/hanyan_arch/miniconda3/etc/profile.d/conda.sh
@@ -26,10 +39,8 @@ DATA_ROOT="${DATA_ROOT:-/NHNHOME/WORKSPACE/0526040099_A/3davs_b4dl}"
 mkdir -p "$OUT_DIR"
 cd "$NEW_CODE_DIR"
 
-CUDA_VISIBLE_DEVICES=$GPU python eval_q3d.py \
-    --model_path "$CKPT_DIR" \
+CUDA_VISIBLE_DEVICES=$GPU python eval_999.py \
+    --sft_dir "$CKPT_DIR" \
     --output_dir "$OUT_DIR" \
     --data_path "$DATA_ROOT/data/3dtesting_val_999.json" \
-    --batch_size 1 \
-    --num_workers 4 \
     "$@"

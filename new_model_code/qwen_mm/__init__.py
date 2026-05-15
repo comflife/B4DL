@@ -32,7 +32,7 @@ from .data import (
     SMAPDataset,
 )
 from .model import MMQwen, MMQwenConfig
-from . import quantizer
+from . import quantizer_999
 
 __all__ = [
     "MMQwen",
@@ -43,5 +43,5 @@ __all__ = [
     "IMAGE_PLACEHOLDER",
     "BOX_START",
     "BOX_END",
-    "quantizer",
+    "quantizer_999",
 ]

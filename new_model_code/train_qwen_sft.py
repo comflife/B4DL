@@ -43,7 +43,6 @@ from qwen_mm import (  # noqa: E402
     IMAGE_PLACEHOLDER,
     LiDARMMDataset,
     MMQwen,
-    quantizer as q3d,
 )
 
 
@@ -85,8 +84,7 @@ class DataArguments:
 # ---------------------------------------------------------------------------
 def add_special_tokens_and_resize(tokenizer, model: MMQwen):
     """Register <image>, <|box_start|>, <|box_end|>, and <0>..<999> as
-    additional special tokens.  The 1,000 coordinate tokens replace the
-    old 1,024 <coord_*> tokens — we drop the latter completely.
+    additional special tokens for 0-999 coordinate prediction.
     """
     # 1,000 coordinate tokens: <0> .. <999>
     coord_names = [f"<{i}>" for i in range(1000)]
@@ -107,7 +105,6 @@ def add_special_tokens_and_resize(tokenizer, model: MMQwen):
 
     image_id = tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER)
     model.set_image_token_id(image_id)
-    # No coord aux loss range needed — we use standard CE on the numeric tokens.
     return added
 
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stage 1b — Full FT with VoxelNeXt + 999-bin coord tokens.
+# Stage 1b — Full SFT with frozen VoxelNeXt + 999-bin coord tokens.
 set -e
 
 [ -f "$HOME/.bashrc.b4dl" ] && source "$HOME/.bashrc.b4dl"
