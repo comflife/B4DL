@@ -61,6 +61,12 @@ class GRPOConfig:
     voxelnext_root: Optional[str] = None
     voxelnext_ckpt: Optional[str] = None
     voxelnext_top_k: int = 256
+    voxelnext_token_mode: str = "topk"
+    bev_query_num: int = 576
+    bev_query_layers: int = 2
+    bev_query_heads: int = 8
+    bev_query_use_view_embed: bool = True
+    bev_memory_max_tokens: int = 0
     data_path: str = ""
     sample_ratio: float = 0.25
     num_rollouts: int = 4
@@ -153,6 +159,16 @@ class GRPOTrainer:
         self.model.set_image_token_id(
             self.tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER)
         )
+        if cfg.voxelnext_token_mode == "bev_query":
+            self.model.init_bev_resampler(
+                num_queries=cfg.bev_query_num,
+                num_layers=cfg.bev_query_layers,
+                num_heads=cfg.bev_query_heads,
+                use_view_embed=cfg.bev_query_use_view_embed,
+            )
+            self.model.bev_resampler = self.model.bev_resampler.to(torch.float32)
+        elif cfg.voxelnext_token_mode != "topk":
+            raise ValueError(f"Unknown voxelnext_token_mode={cfg.voxelnext_token_mode}")
 
         # If sft_dir didn't already include a saved mm_projector, try the
         # standalone path inside sft_dir.
@@ -160,9 +176,29 @@ class GRPOTrainer:
         if proj_path.exists():
             sd = torch.load(proj_path, map_location="cpu")
             if any(k.startswith("mm_projector.") for k in sd):
-                sd = {k.split("mm_projector.")[1]: v for k, v in sd.items() if k.startswith("mm_projector.")}
-            self.model.mm_projector.load_state_dict(sd, strict=True)
-            print(f"[grpo] loaded mm_projector from {proj_path}")
+                feat_sd = {
+                    k.split("mm_projector.")[1]: v
+                    for k, v in sd.items()
+                    if k.startswith("mm_projector.")
+                }
+                pos_sd = {
+                    k.split("pos_projector.")[1]: v
+                    for k, v in sd.items()
+                    if k.startswith("pos_projector.")
+                }
+                bev_sd = {
+                    k.split("bev_resampler.")[1]: v
+                    for k, v in sd.items()
+                    if k.startswith("bev_resampler.")
+                }
+            else:
+                feat_sd, pos_sd, bev_sd = sd, {}, {}
+            self.model.mm_projector.load_state_dict(feat_sd, strict=True)
+            if pos_sd and getattr(self.model, "pos_projector", None) is not None:
+                self.model.pos_projector.load_state_dict(pos_sd, strict=True)
+            if bev_sd and getattr(self.model, "bev_resampler", None) is not None:
+                self.model.bev_resampler.load_state_dict(bev_sd, strict=True)
+            print(f"[grpo] loaded multimodal adapter state from {proj_path}")
 
         # LoRA on attention projections; mm_projector stays frozen so we don't
         # compete with the SFT optimum.
@@ -193,7 +229,10 @@ class GRPOTrainer:
 
         # Joint VoxelNeXt encoder + nuScenes API for raw LiDAR loading.
         if cfg.voxelnext_root and cfg.voxelnext_ckpt:
-            print(f"[grpo] init VoxelNeXt: {cfg.voxelnext_ckpt} top_k={cfg.voxelnext_top_k}")
+            print(
+                f"[grpo] init VoxelNeXt: {cfg.voxelnext_ckpt} "
+                f"top_k={cfg.voxelnext_top_k} mode={cfg.voxelnext_token_mode}"
+            )
             # `self.model` is currently a PeftModel wrapping MMQwen.
             base = self.model.base_model.model if hasattr(self.model, "base_model") else self.model
             base.init_voxelnext(
@@ -201,6 +240,8 @@ class GRPOTrainer:
                 ckpt_path=cfg.voxelnext_ckpt,
                 top_k=cfg.voxelnext_top_k,
                 freeze=True,
+                token_mode=cfg.voxelnext_token_mode,
+                bev_memory_max_tokens=cfg.bev_memory_max_tokens,
             )
 
         from nuscenes.nuscenes import NuScenes
@@ -334,6 +375,9 @@ class GRPOTrainer:
                             "max_prompt_len", "max_new_tokens",
                             "temperature", "top_p", "learning_rate", "kl_coef",
                             "epochs", "lora_r", "lora_alpha", "voxelnext_top_k",
+                            "voxelnext_token_mode", "bev_query_num",
+                            "bev_query_layers", "bev_query_heads",
+                            "bev_memory_max_tokens",
                         )
                     },
                     dir=str(out),
@@ -461,6 +505,12 @@ def parse_args():
         ),
     )
     ap.add_argument("--voxelnext_top_k", type=int, default=256)
+    ap.add_argument("--voxelnext_token_mode", choices=("topk", "bev_query"), default="topk")
+    ap.add_argument("--bev_query_num", type=int, default=576)
+    ap.add_argument("--bev_query_layers", type=int, default=2)
+    ap.add_argument("--bev_query_heads", type=int, default=8)
+    ap.add_argument("--bev_query_use_view_embed", type=lambda x: str(x).lower() == "true", default=True)
+    ap.add_argument("--bev_memory_max_tokens", type=int, default=0)
     ap.add_argument(
         "--data_path",
         default=f"{_data_root}/data/3dtesting_train_999.json",
@@ -498,6 +548,12 @@ def main():
         voxelnext_root=args.voxelnext_root,
         voxelnext_ckpt=args.voxelnext_ckpt,
         voxelnext_top_k=args.voxelnext_top_k,
+        voxelnext_token_mode=args.voxelnext_token_mode,
+        bev_query_num=args.bev_query_num,
+        bev_query_layers=args.bev_query_layers,
+        bev_query_heads=args.bev_query_heads,
+        bev_query_use_view_embed=args.bev_query_use_view_embed,
+        bev_memory_max_tokens=args.bev_memory_max_tokens,
         data_path=args.data_path,
         output_dir=args.output_dir,
         sample_ratio=args.sample_ratio,

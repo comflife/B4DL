@@ -13,9 +13,14 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0+PTX}"
 
 NEW_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_ROOT="${DATA_ROOT:-/NHNHOME/WORKSPACE/0526040099_A/3davs_b4dl}"
-OUT_DIR="$DATA_ROOT/checkpoints/qwen_stage2_grpo_999"
-SFT_MODEL="$DATA_ROOT/checkpoints/qwen_stage1c_999"
+OUT_DIR="$DATA_ROOT/checkpoints/qwen_stage2_grpo_bevq_999"
+SFT_MODEL="$DATA_ROOT/checkpoints/qwen_stage1c_bevq_999"
 GRPO_DATA="$DATA_ROOT/data/grpo_train_999.json"
+VOXELNEXT_TOKEN_MODE="${VOXELNEXT_TOKEN_MODE:-bev_query}"
+BEV_QUERY_NUM="${BEV_QUERY_NUM:-576}"
+BEV_QUERY_LAYERS="${BEV_QUERY_LAYERS:-2}"
+BEV_QUERY_HEADS="${BEV_QUERY_HEADS:-8}"
+BEV_MEMORY_MAX_TOKENS="${BEV_MEMORY_MAX_TOKENS:-0}"
 
 GPU="${GPUS:-0}"
 
@@ -33,23 +38,25 @@ mkdir -p "$OUT_DIR"
 cd "$NEW_CODE_DIR"
 
 CUDA_VISIBLE_DEVICES=$GPU python train_qwen_grpo.py \
-    --model_name_or_path "$SFT_MODEL" \
+    --sft_dir "$SFT_MODEL" \
     --data_path "$GRPO_DATA" \
     --output_dir "$OUT_DIR" \
-    --bf16 True \
-    --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
+    --nuscenes_root "$NUSCENES_ROOT" \
+    --nuscenes_version v1.0-trainval \
+    --n_sweeps 10 \
+    --voxelnext_root "$VOXELNEXT_ROOT" \
+    --voxelnext_ckpt "$VOXELNEXT_CKPT" \
+    --voxelnext_top_k 256 \
+    --voxelnext_token_mode "$VOXELNEXT_TOKEN_MODE" \
+    --bev_query_num "$BEV_QUERY_NUM" \
+    --bev_query_layers "$BEV_QUERY_LAYERS" \
+    --bev_query_heads "$BEV_QUERY_HEADS" \
+    --bev_query_use_view_embed True \
+    --bev_memory_max_tokens "$BEV_MEMORY_MAX_TOKENS" \
+    --epochs 1 \
+    --num_rollouts 4 \
     --gradient_accumulation_steps 4 \
     --learning_rate 1e-6 \
-    --weight_decay 0.0 \
-    --warmup_steps 100 \
-    --lr_scheduler_type "cosine" \
-    --logging_steps 10 \
-    --save_strategy "steps" \
-    --save_steps 1000 \
-    --save_total_limit 2 \
-    --gradient_checkpointing True \
-    --dataloader_num_workers 0 \
-    --report_to wandb \
-    --run_name qwen_stage2_grpo_999 \
+    --log_every 10 \
+    --save_every 1000 \
     "$@"

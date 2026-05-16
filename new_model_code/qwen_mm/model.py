@@ -4,9 +4,10 @@ Forward / generate behaviour:
   - input_ids contains exactly one IMAGE token per sample (a registered
     additional special token, default "<image>").
   - `points` is a list of (N_i, 5) raw LiDAR tensors (one per sample). The
-    in-model VoxelNeXt encoder turns each into a (K, 128) feature blob with
-    per-token (x, y, z). For backwards compat `images` is still accepted
-    when the caller pre-extracted features.
+    in-model VoxelNeXt encoder turns each into either legacy top-K tokens or
+    sparse BEV memory consumed by the trainable BEV query resampler. For
+    backwards compat `images` is still accepted when the caller pre-extracted
+    features.
   - At every IMAGE-token position we replace the single token with the
     output of the linear projector applied to the K-token feature blob,
     so a single id expands into K hidden-dim vectors.
@@ -37,6 +38,140 @@ class MMQwenConfig:
     image_token_id: Optional[int] = None  # set after tokenizer registration
 
 
+class BEVQueryResamplerLayer(nn.Module):
+    """One Q-Former/VAT-style block: query self-attn, BEV cross-attn, MLP."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+        self.norm_q1 = nn.LayerNorm(dim)
+        self.norm_q2 = nn.LayerNorm(dim)
+        self.norm_q3 = nn.LayerNorm(dim)
+        self.norm_mem = nn.LayerNorm(dim)
+
+    def forward(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q1(query)
+        query = query + self.self_attn(q, q, q, need_weights=False)[0]
+
+        q = self.norm_q2(query)
+        mem = self.norm_mem(memory)
+        query = query + self.cross_attn(q, mem, mem, need_weights=False)[0]
+
+        query = query + self.mlp(self.norm_q3(query))
+        return query
+
+
+class BEVQueryResampler(nn.Module):
+    """PAT-style learnable BEV queries over sparse VoxelNeXt BEV memory."""
+
+    def __init__(
+        self,
+        input_dim: int = 128,
+        dim: int = 128,
+        num_queries: int = 576,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        use_view_embed: bool = True,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.dim = int(dim)
+        self.num_queries = int(num_queries)
+        self.num_layers = int(num_layers)
+        self.num_heads = int(num_heads)
+        self.use_view_embed = bool(use_view_embed)
+
+        self.query_embed = nn.Parameter(torch.empty(self.num_queries, self.dim))
+        nn.init.normal_(self.query_embed, std=0.02)
+        self.feat_projector = (
+            nn.Identity()
+            if self.input_dim == self.dim
+            else nn.Linear(self.input_dim, self.dim)
+        )
+        self.xyz_projector = nn.Sequential(
+            nn.Linear(3, self.dim),
+            nn.GELU(),
+            nn.Linear(self.dim, self.dim),
+        )
+        if self.use_view_embed:
+            self.view_embed = nn.Embedding(6, self.dim)
+            q_views = torch.arange(self.num_queries, dtype=torch.long) % 6
+            self.register_buffer("query_view_ids", q_views, persistent=False)
+        else:
+            self.view_embed = None
+            self.register_buffer(
+                "query_view_ids",
+                torch.zeros(self.num_queries, dtype=torch.long),
+                persistent=False,
+            )
+        self.layers = nn.ModuleList(
+            [
+                BEVQueryResamplerLayer(
+                    dim=self.dim, num_heads=self.num_heads, dropout=dropout
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(self.dim)
+        self.output_projector = (
+            nn.Identity()
+            if self.dim == self.input_dim
+            else nn.Linear(self.dim, self.input_dim)
+        )
+
+    @staticmethod
+    def _view_ids_from_xy(xyz: torch.Tensor) -> torch.Tensor:
+        # nuScenes ego frame: +x front, +y left. Six 60-degree sectors.
+        xy = torch.nan_to_num(xyz[:, :2], nan=0.0, posinf=0.0, neginf=0.0)
+        angle = torch.atan2(xy[:, 1], xy[:, 0])
+        sector = torch.floor((angle + torch.pi / 6.0) / (torch.pi / 3.0))
+        return torch.remainder(sector.long(), 6).clamp_(0, 5)
+
+    def forward(self, feat: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
+        if feat.numel() == 0:
+            return feat.new_zeros((self.num_queries, self.input_dim))
+
+        dtype = self.query_embed.dtype
+        feat = feat.to(dtype)
+        xyz = xyz.to(dtype)
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        xyz = torch.nan_to_num(xyz, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Match the VoxelNeXt range normalisation used by the old positional
+        # projector so memory positions start on a stable scale.
+        scale = xyz.new_tensor([54.0, 54.0, 5.0])
+        xyz_n = (xyz / scale).clamp(-1.5, 1.5)
+
+        memory = self.feat_projector(feat) + self.xyz_projector(xyz_n)
+        query = self.query_embed.unsqueeze(0)
+        if self.view_embed is not None:
+            mem_view_ids = self._view_ids_from_xy(xyz).to(feat.device)
+            memory = memory + self.view_embed(mem_view_ids)
+            num_views = self.view_embed.num_embeddings
+            query_view_ids = (
+                torch.arange(self.num_queries, device=feat.device, dtype=torch.long)
+                % num_views
+            )
+            query = query + self.view_embed(query_view_ids).unsqueeze(0)
+
+        memory = memory.unsqueeze(0)
+        for layer in self.layers:
+            query = layer(query, memory)
+        return self.output_projector(self.final_norm(query.squeeze(0)))
+
+
 class MMQwen(Qwen3_5ForCausalLM):
     """Qwen3.5 text-only LLM + LiDAR projector (LLaVA-style splicing)."""
 
@@ -49,6 +184,7 @@ class MMQwen(Qwen3_5ForCausalLM):
         self.mm_input_dim = getattr(config, "mm_input_dim", 128)
         self.image_token_id: Optional[int] = getattr(config, "image_token_id", None)
         self.mm_projector = nn.Linear(self.mm_input_dim, config.hidden_size)
+        self.voxelnext_token_mode = getattr(config, "voxelnext_token_mode", "topk")
 
         # Positional projector for VoxelNeXt features (each token carries
         # an (x, y, z) location). When `mm_pos_dim > 0` each token embedding
@@ -72,6 +208,79 @@ class MMQwen(Qwen3_5ForCausalLM):
         # Joint VoxelNeXt encoder is attached lazily by `init_voxelnext`.
         self.voxelnext = None
 
+        self.use_bev_query = bool(getattr(config, "use_bev_query", False))
+        self.bev_query_num = int(getattr(config, "bev_query_num", 576))
+        self.bev_query_layers = int(getattr(config, "bev_query_layers", 2))
+        self.bev_query_heads = int(getattr(config, "bev_query_heads", 8))
+        self.bev_query_dim = int(getattr(config, "bev_query_dim", self.mm_input_dim))
+        self.bev_query_dropout = float(getattr(config, "bev_query_dropout", 0.0))
+        self.bev_query_use_view_embed = bool(
+            getattr(config, "bev_query_use_view_embed", True)
+        )
+        self.bev_resampler = None
+        if self.use_bev_query:
+            self.init_bev_resampler(
+                num_queries=self.bev_query_num,
+                num_layers=self.bev_query_layers,
+                num_heads=self.bev_query_heads,
+                query_dim=self.bev_query_dim,
+                dropout=self.bev_query_dropout,
+                use_view_embed=self.bev_query_use_view_embed,
+            )
+
+    def init_bev_resampler(
+        self,
+        num_queries: int = 576,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        query_dim: Optional[int] = None,
+        dropout: float = 0.0,
+        use_view_embed: bool = True,
+        force_reinit: bool = False,
+    ):
+        """Attach the trainable BEV query resampler used by VAT-style input."""
+        num_queries = int(num_queries)
+        num_layers = int(num_layers)
+        num_heads = int(num_heads)
+        query_dim = int(query_dim or self.mm_input_dim)
+        dropout = float(dropout)
+        use_view_embed = bool(use_view_embed)
+        same_shape = (
+            self.bev_resampler is not None
+            and self.bev_resampler.num_queries == num_queries
+            and self.bev_resampler.num_layers == num_layers
+            and self.bev_resampler.num_heads == num_heads
+            and self.bev_resampler.dim == query_dim
+            and self.bev_resampler.use_view_embed == use_view_embed
+        )
+        if force_reinit or not same_shape:
+            self.bev_resampler = BEVQueryResampler(
+                input_dim=self.mm_input_dim,
+                dim=query_dim,
+                num_queries=num_queries,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                dropout=dropout,
+                use_view_embed=use_view_embed,
+            )
+        self.use_bev_query = True
+        self.voxelnext_token_mode = "bev_query"
+        self.bev_query_num = num_queries
+        self.bev_query_layers = num_layers
+        self.bev_query_heads = num_heads
+        self.bev_query_dim = query_dim
+        self.bev_query_dropout = dropout
+        self.bev_query_use_view_embed = use_view_embed
+        self.config.use_bev_query = True
+        self.config.voxelnext_token_mode = "bev_query"
+        self.config.bev_query_num = num_queries
+        self.config.bev_query_layers = num_layers
+        self.config.bev_query_heads = num_heads
+        self.config.bev_query_dim = query_dim
+        self.config.bev_query_dropout = dropout
+        self.config.bev_query_use_view_embed = use_view_embed
+        return self.bev_resampler
+
     # ------------------------------------------------------------------
     # Joint VoxelNeXt encoder (frozen by default).
     # ------------------------------------------------------------------
@@ -82,6 +291,8 @@ class MMQwen(Qwen3_5ForCausalLM):
         cfg_file=None,
         top_k: int = 256,
         freeze: bool = True,
+        token_mode: Optional[str] = None,
+        bev_memory_max_tokens: int = 0,
         device=None,
     ):
         """Attach a pcdet VoxelNeXt encoder. Requires pcdet to be importable
@@ -97,6 +308,8 @@ class MMQwen(Qwen3_5ForCausalLM):
             cfg_file=cfg_file,
             top_k=top_k,
             freeze=freeze,
+            token_mode=token_mode or self.voxelnext_token_mode,
+            bev_memory_max_tokens=bev_memory_max_tokens,
             device=dev,
         )
 
@@ -136,6 +349,16 @@ class MMQwen(Qwen3_5ForCausalLM):
 
         out = []
         for blob in images:
+            if blob is None:
+                out.append(
+                    torch.zeros(
+                        1,
+                        self.config.hidden_size,
+                        dtype=target_dtype,
+                        device=self.device,
+                    )
+                )
+                continue
             feat = blob["feat"].to(target_dtype).to(self.device)
             xyz = blob["xyz"].to(target_dtype).to(self.device)
             mask = blob.get("mask")
@@ -143,8 +366,24 @@ class MMQwen(Qwen3_5ForCausalLM):
                 mask = mask.to(self.device).bool()
                 feat = feat[mask]
                 xyz = xyz[mask]
-            tok = self.mm_projector(feat)
-            if self.pos_projector is not None and xyz.shape[0] > 0:
+
+            is_bev_memory = blob.get("token_type") == "bev_memory"
+            if is_bev_memory:
+                if self.bev_resampler is None:
+                    raise RuntimeError(
+                        "VoxelNeXt returned BEV memory tokens but "
+                        "MMQwen.bev_resampler is not initialised."
+                    )
+                feat = self.bev_resampler(feat, xyz).to(target_dtype)
+                tok = self.mm_projector(feat)
+            else:
+                tok = self.mm_projector(feat)
+
+            if (
+                not is_bev_memory
+                and self.pos_projector is not None
+                and xyz.shape[0] > 0
+            ):
                 scale = self._xyz_norm_scale.to(target_dtype).to(self.device)
                 xyz_n = (xyz / scale).clamp(-1.5, 1.5)
                 tok = tok + self.pos_projector(xyz_n)

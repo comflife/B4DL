@@ -89,6 +89,13 @@ def parse_args():
         ),
     )
     ap.add_argument("--voxelnext_top_k", type=int, default=256)
+    ap.add_argument("--voxelnext_token_mode", choices=("topk", "bev_query"), default=None)
+    ap.add_argument("--bev_query_num", type=int, default=None)
+    ap.add_argument("--bev_query_layers", type=int, default=None)
+    ap.add_argument("--bev_query_heads", type=int, default=None)
+    ap.add_argument("--bev_query_dim", type=int, default=None)
+    ap.add_argument("--bev_query_use_view_embed", type=lambda x: str(x).lower() == "true", default=None)
+    ap.add_argument("--bev_memory_max_tokens", type=int, default=0)
     ap.add_argument(
         "--max_samples",
         type=int,
@@ -117,19 +124,45 @@ def load_model(
     voxelnext_root: str = None,
     voxelnext_ckpt: str = None,
     voxelnext_top_k: int = 256,
+    voxelnext_token_mode: str = None,
+    bev_query_num: int = None,
+    bev_query_layers: int = None,
+    bev_query_heads: int = None,
+    bev_query_dim: int = None,
+    bev_query_use_view_embed: bool = None,
+    bev_memory_max_tokens: int = 0,
 ):
     tok = AutoTokenizer.from_pretrained(sft_dir)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     model = MMQwen.from_pretrained(sft_dir, dtype=torch.bfloat16, attn_implementation="sdpa")
+    token_mode = voxelnext_token_mode or getattr(model, "voxelnext_token_mode", "topk")
+    if token_mode == "bev_query":
+        model.init_bev_resampler(
+            num_queries=bev_query_num or getattr(model, "bev_query_num", 576),
+            num_layers=bev_query_layers or getattr(model, "bev_query_layers", 2),
+            num_heads=bev_query_heads or getattr(model, "bev_query_heads", 8),
+            query_dim=bev_query_dim or getattr(model, "bev_query_dim", model.mm_input_dim),
+            use_view_embed=(
+                bev_query_use_view_embed
+                if bev_query_use_view_embed is not None
+                else getattr(model, "bev_query_use_view_embed", True)
+            ),
+        )
+        model.bev_resampler = model.bev_resampler.to(torch.float32)
     if torch.cuda.is_available():
         model.cuda()
     if voxelnext_root and voxelnext_ckpt:
-        print(f"[eval] init VoxelNeXt: {voxelnext_ckpt} top_k={voxelnext_top_k}")
+        print(
+            f"[eval] init VoxelNeXt: {voxelnext_ckpt} "
+            f"top_k={voxelnext_top_k} mode={token_mode}"
+        )
         model.init_voxelnext(
             voxelnext_root=voxelnext_root,
             ckpt_path=voxelnext_ckpt,
             top_k=voxelnext_top_k,
+            token_mode=token_mode,
+            bev_memory_max_tokens=bev_memory_max_tokens,
             freeze=True,
         )
     if lora_adapter:
@@ -304,6 +337,13 @@ def main():
         voxelnext_root=args.voxelnext_root,
         voxelnext_ckpt=args.voxelnext_ckpt,
         voxelnext_top_k=args.voxelnext_top_k,
+        voxelnext_token_mode=args.voxelnext_token_mode,
+        bev_query_num=args.bev_query_num,
+        bev_query_layers=args.bev_query_layers,
+        bev_query_heads=args.bev_query_heads,
+        bev_query_dim=args.bev_query_dim,
+        bev_query_use_view_embed=args.bev_query_use_view_embed,
+        bev_memory_max_tokens=args.bev_memory_max_tokens,
     )
     from nuscenes.nuscenes import NuScenes
     nusc = NuScenes(

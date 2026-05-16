@@ -124,9 +124,22 @@ class LiDARMMDataset(Dataset):
         nuscenes_version: str = "v1.0-trainval",
         n_sweeps: int = 10,
         max_length: int = 2048,
+        task_filter: Optional[str] = None,
+        template_filter: Optional[str] = None,
     ):
         with open(data_path) as f:
             self.data = json.load(f)
+        if task_filter:
+            allowed = {x.strip() for x in task_filter.split(",") if x.strip()}
+            self.data = [x for x in self.data if x.get("task") in allowed]
+        if template_filter:
+            allowed = {x.strip() for x in template_filter.split(",") if x.strip()}
+            self.data = [x for x in self.data if x.get("template_type") in allowed]
+        if not self.data:
+            raise RuntimeError(
+                f"No samples left after task_filter={task_filter!r} "
+                f"template_filter={template_filter!r}"
+            )
         self.tokenizer = tokenizer
         self.nuscenes_root = nuscenes_root
         self.nuscenes_version = nuscenes_version

@@ -1,26 +1,26 @@
 #!/bin/bash
-# Master pipeline — Stage1a → 1b → 1c → evals.
+# Master pipeline — LiDAR-LLM-style alignment → grounding → VG refinement.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="${DATA_ROOT:-/NHNHOME/WORKSPACE/0526040099_A/3davs_b4dl}"
 CHECKPOINT_ROOT="$DATA_ROOT/checkpoints"
 
-# Override per-run if desired.
-GPUS="${GPUS:-0,1}"
+# Override per-run if desired. Export so child stage scripts inherit it.
+export GPUS="${GPUS:-0,1,2,3}"
 
-STAGE1A_DIR="$CHECKPOINT_ROOT/qwen_stage1a_999"
-STAGE1B_DIR="$CHECKPOINT_ROOT/qwen_stage1b_999"
-STAGE1C_DIR="$CHECKPOINT_ROOT/qwen_stage1c_999"
+STAGE1A_DIR="$CHECKPOINT_ROOT/qwen_lidarllm_stage1_align_999"
+STAGE1B_DIR="$CHECKPOINT_ROOT/qwen_lidarllm_stage2_ground_999"
+STAGE1C_DIR="$CHECKPOINT_ROOT/qwen_lidarllm_stage3_detarea_999"
 
 echo "=============================================="
-echo "VoxelNeXt+999-bin full training pipeline"
+echo "LiDAR-LLM-style VoxelNeXt/PAT + 999-bin training pipeline"
 echo "GPUS=$GPUS | DATA_ROOT=$DATA_ROOT"
 echo "=============================================="
 
 # -------- Stage 1a --------
 if [ ! -f "$STAGE1A_DIR/mm_projector.bin" ]; then
-    echo "--- Stage 1a: projector warmup ---"
+    echo "--- Stage 1a: caption alignment ---"
     bash "$SCRIPT_DIR/stage1a.sh"
 else
     echo "--- Stage 1a: found projector at $STAGE1A_DIR, skip ---"
@@ -28,7 +28,7 @@ fi
 
 # -------- Stage 1b --------
 if [ ! -f "$STAGE1B_DIR/model.safetensors" ] && [ ! -f "$STAGE1B_DIR/pytorch_model.bin" ]; then
-    echo "--- Stage 1b: full SFT, frozen VoxelNeXt ---"
+    echo "--- Stage 1b: grounding/perception SFT, frozen VoxelNeXt ---"
     bash "$SCRIPT_DIR/stage1b.sh"
 else
     echo "--- Stage 1b: checkpoint found at $STAGE1B_DIR, skip ---"

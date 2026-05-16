@@ -35,6 +35,12 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0+PTX}"
 
 NEW_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_ROOT="${DATA_ROOT:-/NHNHOME/WORKSPACE/0526040099_A/3davs_b4dl}"
+VOXELNEXT_TOKEN_MODE="${VOXELNEXT_TOKEN_MODE:-bev_query}"
+BEV_QUERY_NUM="${BEV_QUERY_NUM:-576}"
+BEV_QUERY_LAYERS="${BEV_QUERY_LAYERS:-2}"
+BEV_QUERY_HEADS="${BEV_QUERY_HEADS:-8}"
+BEV_QUERY_DIM="${BEV_QUERY_DIM:-}"
+BEV_MEMORY_MAX_TOKENS="${BEV_MEMORY_MAX_TOKENS:-0}"
 
 mkdir -p "$OUT_DIR"
 cd "$NEW_CODE_DIR"
@@ -43,4 +49,11 @@ CUDA_VISIBLE_DEVICES=$GPU python eval_999.py \
     --sft_dir "$CKPT_DIR" \
     --output_dir "$OUT_DIR" \
     --data_path "$DATA_ROOT/data/3dtesting_val_999.json" \
+    --voxelnext_token_mode "$VOXELNEXT_TOKEN_MODE" \
+    --bev_query_num "$BEV_QUERY_NUM" \
+    --bev_query_layers "$BEV_QUERY_LAYERS" \
+    --bev_query_heads "$BEV_QUERY_HEADS" \
+    ${BEV_QUERY_DIM:+--bev_query_dim "$BEV_QUERY_DIM"} \
+    --bev_query_use_view_embed True \
+    --bev_memory_max_tokens "$BEV_MEMORY_MAX_TOKENS" \
     "$@"

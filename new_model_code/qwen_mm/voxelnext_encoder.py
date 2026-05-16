@@ -7,9 +7,8 @@ in keyframe ego frame). This encoder:
      nuScenes config: voxel_size 0.075m, range [-54,54]xy / [-5,3]z).
   2. Runs the full VoxelNeXt forward (MeanVFE -> backbone -> dense_head)
      under torch.no_grad() so no gradients flow through the encoder.
-  3. Picks top-K voxels per sample by max-class hm score, returns a list
-     of dicts {feat, xyz, mask} -- the same layout MMQwen._project_images
-     already accepts for VoxelNeXt-style features.
+  3. Returns either the legacy top-K detector tokens or sparse BEV memory
+     tokens for the trainable BEV query resampler in MMQwen.
 
 pcdet imports are deferred to __init__ so simply importing qwen_mm does
 not require pcdet to be built. Build it once with
@@ -55,7 +54,7 @@ class _DummyDataset:
 
 
 class VoxelNeXtEncoder(nn.Module):
-    """Frozen pcdet VoxelNeXt -> per-sample top-K voxel queries."""
+    """Frozen pcdet VoxelNeXt -> per-sample LiDAR tokens."""
 
     FEAT_DIM = 128
     FEATURE_MAP_STRIDE = 8
@@ -67,6 +66,8 @@ class VoxelNeXtEncoder(nn.Module):
         cfg_file: Optional[str] = None,
         top_k: int = 256,
         freeze: bool = True,
+        token_mode: str = "topk",
+        bev_memory_max_tokens: int = 0,
         device: str = "cuda",
     ):
         super().__init__()
@@ -74,6 +75,10 @@ class VoxelNeXtEncoder(nn.Module):
         self.ckpt_path = ckpt_path
         self.top_k = int(top_k)
         self.freeze = bool(freeze)
+        self.token_mode = str(token_mode)
+        if self.token_mode not in {"topk", "bev_query"}:
+            raise ValueError(f"Unsupported VoxelNeXt token_mode: {self.token_mode}")
+        self.bev_memory_max_tokens = int(bev_memory_max_tokens)
         self._target_device = torch.device(device)
 
         if cfg_file is None:
@@ -191,6 +196,49 @@ class VoxelNeXtEncoder(nn.Module):
         return points[keep]
 
     # ------------------------------------------------------------------
+    def _xy_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        yi = indices[:, 1].float()
+        xi = indices[:, 2].float()
+        x_real = (
+            (xi + 0.5) * self.FEATURE_MAP_STRIDE * self.voxel_size[0]
+            + self.point_cloud_range[0]
+        )
+        y_real = (
+            (yi + 0.5) * self.FEATURE_MAP_STRIDE * self.voxel_size[1]
+            + self.point_cloud_range[1]
+        )
+        return torch.stack([x_real, y_real], dim=1)
+
+    def _build_bev_memory(
+        self,
+        feats_all: torch.Tensor,
+        indices_all: torch.Tensor,
+        score_all: Optional[torch.Tensor],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Return sparse BEV memory tokens for the trainable query resampler."""
+        n = feats_all.shape[0]
+        if n == 0:
+            return None
+
+        if self.bev_memory_max_tokens > 0 and n > self.bev_memory_max_tokens:
+            if score_all is not None and score_all.shape[0] == n:
+                keep = score_all.topk(self.bev_memory_max_tokens).indices
+            else:
+                keep = feats_all.norm(dim=-1).topk(self.bev_memory_max_tokens).indices
+            feats_all = feats_all[keep]
+            indices_all = indices_all[keep]
+
+        xy = self._xy_from_indices(indices_all)
+        z = torch.zeros((xy.shape[0], 1), dtype=xy.dtype, device=xy.device)
+        xyz = torch.cat([xy, z], dim=1)
+        mask = torch.ones(xyz.shape[0], dtype=torch.bool, device=xyz.device)
+        return {
+            "feat": feats_all,
+            "xyz": xyz,
+            "mask": mask,
+            "token_type": "bev_memory",
+        }
+
     def _encode_one(self, points: torch.Tensor) -> Optional[Dict[str, torch.Tensor]]:
         """One-sample VoxelNeXt forward + top-K. points: (N, 5)."""
         device = points.device
@@ -237,6 +285,9 @@ class VoxelNeXtEncoder(nn.Module):
         hm_sig = torch.sigmoid(hm_concat)
         score_all, cls_all = hm_sig.max(dim=-1)
 
+        if self.token_mode == "bev_query":
+            return self._build_bev_memory(feats_all, indices_all, score_all)
+
         K = min(self.top_k, score_all.shape[0])
         if K == 0:
             return None
@@ -245,10 +296,7 @@ class VoxelNeXtEncoder(nn.Module):
         coords_k = indices_all[topi]
         cls_k = cls_all[topi]
 
-        yi = coords_k[:, 1].float()
-        xi = coords_k[:, 2].float()
-        x_real = (xi + 0.5) * self.FEATURE_MAP_STRIDE * self.voxel_size[0] + self.point_cloud_range[0]
-        y_real = (yi + 0.5) * self.FEATURE_MAP_STRIDE * self.voxel_size[1] + self.point_cloud_range[1]
+        xy_real = self._xy_from_indices(coords_k)
 
         # z from the head whose argmax class won this voxel.
         z_pred = torch.zeros(K, device=device)
@@ -262,7 +310,7 @@ class VoxelNeXtEncoder(nn.Module):
                     break
             z_pred[k_idx] = head_outs[h_idx]["center_z"][topi[k_idx], 0]
 
-        xyz_k = torch.stack([x_real, y_real, z_pred], dim=1)
+        xyz_k = torch.cat([xy_real, z_pred[:, None]], dim=1)
 
         feat_pad = torch.zeros(self.top_k, self.FEAT_DIM, device=device)
         xyz_pad = torch.zeros(self.top_k, 3, device=device)

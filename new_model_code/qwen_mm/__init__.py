@@ -2,10 +2,10 @@
 
 Components:
 
-  model.MMQwen          Qwen3_5ForCausalLM subclass with a Linear projector
-                        that maps VoxelNeXt voxel-query tokens (K, 128)
-                        plus their (K, 3) xyz into hidden-dim embeddings,
-                        spliced at the position of <image> in input_ids.
+  model.MMQwen          Qwen3_5ForCausalLM subclass with either the legacy
+                        VoxelNeXt top-K token projector or a BEV query
+                        resampler that cross-attends sparse BEV memory into
+                        fixed soft-prompt tokens, spliced at <image>.
                         Holds the pcdet VoxelNeXt encoder (frozen) inside
                         — call MMQwen.init_voxelnext(...) after loading.
 

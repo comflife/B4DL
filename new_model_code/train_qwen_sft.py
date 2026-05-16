@@ -2,9 +2,10 @@
 
 Two phases share this entry point:
 
-  --tune_mm_only True   Stage 1a: freeze the LLM, train only `mm_projector`
-                        and the embedding rows for the newly-added special
-                        tokens. High LR, fast convergence.
+  --tune_mm_only True   Stage 1a: freeze the LLM, train only the multimodal
+                        adapter modules (`mm_projector`, optional positional
+                        projector / BEV query resampler). High LR, fast
+                        convergence.
   --tune_mm_only False  Stage 1b: full-parameter fine-tune of LLM + projector,
                         loading the warmed-up projector via
                         --pretrain_mm_projector.
@@ -61,6 +62,24 @@ class ModelArguments:
     voxelnext_root: str = field(default=None)
     voxelnext_ckpt: str = field(default=None)
     voxelnext_top_k: int = field(default=256)
+    voxelnext_token_mode: str = field(
+        default="topk",
+        metadata={"help": "'topk' for legacy detector tokens, 'bev_query' for VAT-style BEV resampling."},
+    )
+    bev_query_num: int = field(default=576)
+    bev_query_layers: int = field(default=2)
+    bev_query_heads: int = field(default=8)
+    bev_query_dim: int = field(
+        default=128,
+        metadata={
+            "help": "Internal PAT/query dimension. Use 768 for the LiDAR-LLM-style setup."
+        },
+    )
+    bev_query_use_view_embed: bool = field(default=True)
+    bev_memory_max_tokens: int = field(
+        default=0,
+        metadata={"help": "Maximum sparse BEV memory tokens before BEV query cross-attention; <=0 keeps all."},
+    )
     voxelnext_freeze: bool = field(default=True)
     pretrain_mm_projector: Optional[str] = field(
         default=None,
@@ -79,6 +98,14 @@ class DataArguments:
     nuscenes_version: str = field(default="v1.0-trainval")
     n_sweeps: int = field(default=10)
     max_length: int = field(default=2048)
+    task_filter: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated task names to keep, e.g. nucaption or nugrounding."},
+    )
+    template_filter: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated template_type names to keep, e.g. det_area."},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +136,9 @@ def add_special_tokens_and_resize(tokenizer, model: MMQwen):
 
 
 def freeze_llm_except_projector(model: MMQwen, num_added_tokens: int):
-    """Stage 1a: freeze everything except `mm_projector` (and `pos_projector`
-    when configured). Embedding/lm_head rows for the new special tokens are
-    left frozen — same trade-off as the original LLaVA stage-1 recipe.
+    """Stage 1a: freeze everything except the multimodal adapter modules.
+    Embedding/lm_head rows for the new special tokens are left frozen —
+    same trade-off as the original LLaVA stage-1 recipe.
     """
     for p in model.parameters():
         p.requires_grad = False
@@ -119,6 +146,9 @@ def freeze_llm_except_projector(model: MMQwen, num_added_tokens: int):
         p.requires_grad = True
     if getattr(model, "pos_projector", None) is not None:
         for p in model.pos_projector.parameters():
+            p.requires_grad = True
+    if getattr(model, "bev_resampler", None) is not None:
+        for p in model.bev_resampler.parameters():
             p.requires_grad = True
 
 
@@ -133,6 +163,7 @@ def load_mm_projector(model: MMQwen, path: str):
 
     feat_sd = {}
     pos_sd = {}
+    bev_sd = {}
     legacy = True
     for k, v in sd.items():
         if k.startswith("mm_projector."):
@@ -140,6 +171,9 @@ def load_mm_projector(model: MMQwen, path: str):
             legacy = False
         elif k.startswith("pos_projector."):
             pos_sd[k.split("pos_projector.", 1)[1]] = v
+            legacy = False
+        elif k.startswith("bev_resampler."):
+            bev_sd[k.split("bev_resampler.", 1)[1]] = v
             legacy = False
     if legacy:
         feat_sd = sd
@@ -153,6 +187,12 @@ def load_mm_projector(model: MMQwen, path: str):
         else:
             pmiss, punexp = model.pos_projector.load_state_dict(pos_sd, strict=True)
             print(f"[sft] loaded pos_projector (missing={pmiss}, unexpected={punexp})")
+    if bev_sd:
+        if getattr(model, "bev_resampler", None) is None:
+            print(f"[sft] WARNING: ckpt has bev_resampler but model is not in bev_query mode — skipping")
+        else:
+            bmiss, bunexp = model.bev_resampler.load_state_dict(bev_sd, strict=True)
+            print(f"[sft] loaded bev_resampler (missing={bmiss}, unexpected={bunexp})")
 
 
 def save_mm_projector(model: MMQwen, output_dir: str):
@@ -164,6 +204,9 @@ def save_mm_projector(model: MMQwen, output_dir: str):
     if model.pos_projector is not None:
         for k, v in model.pos_projector.state_dict().items():
             out[f"pos_projector.{k}"] = v
+    if getattr(model, "bev_resampler", None) is not None:
+        for k, v in model.bev_resampler.state_dict().items():
+            out[f"bev_resampler.{k}"] = v
     torch.save(out, Path(output_dir) / "mm_projector.bin")
 
 
@@ -188,6 +231,7 @@ def main():
         torch_dtype=dtype,
         attn_implementation="sdpa",
     )
+    loaded_mm_dim = getattr(model.config, "mm_input_dim", None)
     model.mm_input_dim = model_args.mm_input_dim
     # NOTE: keep projectors in fp32 — tiny module, bf16 grad underflow is
     # a common source of nan when only the projector trains (stage 1a).
@@ -195,9 +239,18 @@ def main():
     # with torch_dtype=torch.bfloat16, parameters that are NOT present in the
     # checkpoint (like our custom mm_projector) get corrupted with NaN/garbage
     # values. We always rebuild the projector here so it has clean init.
-    model.mm_projector = nn.Linear(
-        model_args.mm_input_dim, model.config.hidden_size
-    ).to(torch.float32)
+    keep_loaded_projector = (
+        loaded_mm_dim == model_args.mm_input_dim
+        and getattr(model, "mm_projector", None) is not None
+        and model.mm_projector.in_features == model_args.mm_input_dim
+        and model.mm_projector.out_features == model.config.hidden_size
+    )
+    if keep_loaded_projector:
+        model.mm_projector = model.mm_projector.to(torch.float32)
+    else:
+        model.mm_projector = nn.Linear(
+            model_args.mm_input_dim, model.config.hidden_size
+        ).to(torch.float32)
     model.config.mm_input_dim = model_args.mm_input_dim
 
     # Positional projector (VoxelNeXt path). Build if requested even when
@@ -218,6 +271,24 @@ def main():
     else:
         model.pos_projector = None
 
+    model.voxelnext_token_mode = model_args.voxelnext_token_mode
+    model.config.voxelnext_token_mode = model_args.voxelnext_token_mode
+    if model_args.voxelnext_token_mode == "bev_query":
+        model.init_bev_resampler(
+            num_queries=model_args.bev_query_num,
+            num_layers=model_args.bev_query_layers,
+            num_heads=model_args.bev_query_heads,
+            query_dim=model_args.bev_query_dim,
+            use_view_embed=model_args.bev_query_use_view_embed,
+        )
+        model.bev_resampler = model.bev_resampler.to(torch.float32)
+    elif model_args.voxelnext_token_mode == "topk":
+        model.use_bev_query = False
+        model.config.use_bev_query = False
+        model.bev_resampler = None
+    else:
+        raise ValueError(f"Unknown voxelnext_token_mode={model_args.voxelnext_token_mode}")
+
     n_added = add_special_tokens_and_resize(tokenizer, model)
     if training_args.local_rank in (-1, 0):
         print(
@@ -235,6 +306,8 @@ def main():
             print(
                 f"[sft] init VoxelNeXt: root={model_args.voxelnext_root} "
                 f"ckpt={model_args.voxelnext_ckpt} top_k={model_args.voxelnext_top_k} "
+                f"mode={model_args.voxelnext_token_mode} "
+                f"bev_mem_max={model_args.bev_memory_max_tokens} "
                 f"freeze={model_args.voxelnext_freeze}"
             )
         model.init_voxelnext(
@@ -242,6 +315,8 @@ def main():
             ckpt_path=model_args.voxelnext_ckpt,
             top_k=model_args.voxelnext_top_k,
             freeze=model_args.voxelnext_freeze,
+            token_mode=model_args.voxelnext_token_mode,
+            bev_memory_max_tokens=model_args.bev_memory_max_tokens,
         )
 
     if model_args.tune_mm_only:
@@ -260,7 +335,11 @@ def main():
         nuscenes_version=data_args.nuscenes_version,
         n_sweeps=data_args.n_sweeps,
         max_length=data_args.max_length,
+        task_filter=data_args.task_filter,
+        template_filter=data_args.template_filter,
     )
+    if training_args.local_rank in (-1, 0):
+        print(f"[sft] train samples after filters: {len(train_ds)}")
     collator = Collator(pad_token_id=tokenizer.pad_token_id)
 
     class _DebugTrainer(Trainer):
@@ -269,7 +348,12 @@ def main():
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             # ---- nan hunt: VoxelNeXt output ---------------------------------
             points = inputs.get("points")
-            if points is not None and hasattr(model, "voxelnext") and model.voxelnext is not None:
+            if (
+                os.environ.get("DEBUG_VOXELNEXT_NAN") == "1"
+                and points is not None
+                and hasattr(model, "voxelnext")
+                and model.voxelnext is not None
+            ):
                 with torch.no_grad():
                     try:
                         blobs = model.voxelnext(points)
